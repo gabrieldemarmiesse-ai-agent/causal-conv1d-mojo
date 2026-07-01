@@ -84,16 +84,11 @@ def update_kernel[
     # Phase 2: read trailing W-1 history into x_vals (with writeback for
     # the small-state_len edge case).
     var state_vals = SIMD[dtype, width - 1](0)
-    comptime if width == 3 or width == 4:
-        var s_vec = state_lane.load[width = width - 1, alignment=2](
-            Int((sl - Int32(width - 1)) * state_l_stride)
-        )
-        comptime for i in range(width - 1):
-            state_vals[i] = s_vec[i]
-    else:
-        comptime for i in range(width - 1):
-            var read_idx: Int32 = sl - Int32(width - 1) + Int32(i)
-            state_vals[i] = state_lane[Int(read_idx * state_l_stride)]
+    var s_vec = state_lane.load[width = width - 1, alignment=2](
+        Int((sl - Int32(width - 1)) * state_l_stride)
+    )
+    comptime for i in range(width - 1):
+        state_vals[i] = s_vec[i]
 
     comptime for i in range(width - 1):
         var write_idx: Int32 = sl - advance_len - Int32(width - 1) + Int32(i)
