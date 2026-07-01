@@ -36,7 +36,6 @@ def native_update_mps(
             x.stride(1),
             x.stride(2),
             weight.stride(0),
-            weight.stride(1),
             conv_state.stride(0),
             conv_state.stride(1),
             conv_state.stride(2),
@@ -46,12 +45,6 @@ def native_update_mps(
             int(bias is not None),
             int(apply_silu),
             _DTYPE_CODE[x.dtype],
-            0,  # stream_handle_addr — Metal has no streams
             weight.shape[1],
-            0,  # has_state_indices (always false in this trimmed repro)
-            0,  # state_indices_addr
-            0,  # has_cache_seqlens (always false in this trimmed repro)
-            0,  # cache_seqlens_addr
-            0,  # use_external_stream: Metal path enqueues on ctx
         )
     )
