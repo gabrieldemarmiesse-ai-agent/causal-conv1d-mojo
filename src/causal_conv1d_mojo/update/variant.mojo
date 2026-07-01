@@ -2,24 +2,25 @@
 dtype=float16, width=4 hardcoded in kernel.mojo, no -D defines needed).
 """
 
+from std.gpu.host import DeviceContext
 from std.os import abort
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 
 from launch import launch_update
-from _ctx import acquire_ctx_handle
 
 
 def causal_conv1d_update_acquire_ctx(
     mut py_self: PythonObject,
     mut args: PythonObject,
 ) raises -> PythonObject:
-    """Create + retain a process-lifetime DeviceContext.
-
-    Called once per variant from the Python side; the returned address
-    is reused for every subsequent `causal_conv1d_update_variant` call.
+    """Create + retain a process-lifetime DeviceContext, and leak the
+    wrapper. Called once from the Python side; the returned address is
+    reused for every subsequent `causal_conv1d_update_variant` call.
     """
-    var addr: Int = acquire_ctx_handle()
+    var ctx = DeviceContext()
+    ctx._retain()
+    var addr: Int = Int(ctx._handle.value())
     return PythonObject(addr)
 
 
