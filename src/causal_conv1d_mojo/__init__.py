@@ -17,7 +17,6 @@ import importlib.machinery
 import importlib.util
 import sys
 import tempfile
-from functools import lru_cache
 from pathlib import Path
 
 import torch
@@ -30,7 +29,6 @@ _PKG_DIR = Path(__file__).resolve().parent
 _VARIANT_MOJO = _PKG_DIR / "variant.mojo"
 
 
-@lru_cache(maxsize=1)
 def _objc() -> ctypes.CDLL:
     libobjc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
     libobjc.sel_registerName.restype = ctypes.c_void_p
@@ -51,7 +49,6 @@ def gpu_address(t: torch.Tensor) -> int:
     return base_gpu + (t.data_ptr() - buf_obj)
 
 
-@lru_cache(maxsize=None)
 def _get_variant_fn():
     so_path = Path(tempfile.mkstemp(suffix=".so")[1])
     cmd = ["build", str(_VARIANT_MOJO), "--emit", "shared-lib", "-o", str(so_path)]
