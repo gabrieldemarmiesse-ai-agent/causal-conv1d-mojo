@@ -8,7 +8,7 @@ from std.os import abort
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 
-from kernel import dtype, kNThreadsUpdate, update_kernel
+from kernel import dtype, kBatch, kNThreadsUpdate, update_kernel
 
 
 def causal_conv1d_update_acquire_ctx(
@@ -31,9 +31,8 @@ def causal_conv1d_update_variant(
 ) raises -> PythonObject:
     var x_addr = Int(py=args[0])
     var o_addr = Int(py=args[1])
-    var batch_int = Int(py=args[2])
-    # ctx_handle is appended as args[3] by call_update.
-    var ctx_handle_addr = Int(py=args[3])
+    # ctx_handle is appended as args[2] by call_update.
+    var ctx_handle_addr = Int(py=args[2])
 
     # Reconstruct a non-owning DeviceContext from the cached handle —
     # avoids creating a fresh DeviceContext (and its stream) every call.
@@ -42,7 +41,7 @@ def causal_conv1d_update_variant(
     )
     var ctx = DeviceContext(_DeviceContextPtr[mut=True](raw_ctx_ptr))
 
-    var grid = (batch_int,)
+    var grid = (kBatch,)
 
     var x_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
         unsafe_from_address=x_addr

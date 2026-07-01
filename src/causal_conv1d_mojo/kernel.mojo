@@ -7,6 +7,7 @@ from std.gpu import block_idx, thread_idx
 
 
 comptime kNThreadsUpdate: Int = 16
+comptime kBatch: Int = 2
 comptime dtype = DType.float16
 
 
