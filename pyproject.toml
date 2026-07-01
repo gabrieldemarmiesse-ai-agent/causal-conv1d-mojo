@@ -12,20 +12,6 @@ dependencies = [
     "mojo-compiler-mojo-libs==1.0.0b3.dev2026062306",
 ]
 
-[project.scripts]
-causal-conv1d-mojo = "causal_conv1d_mojo._cli:main"
-
-[project.optional-dependencies]
-nvidia = [
-    "torch==2.8.0 ; sys_platform == 'linux'",
-    "nvidia-cuda-nvcc-cu12==12.8.* ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "causal-conv1d @ https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2.post1/causal_conv1d-1.6.2.post1+cu12torch2.8cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux'",
-]
-rocm = [
-    "torch==2.8.0 ; sys_platform == 'linux'",
-    "pytorch-triton-rocm ; sys_platform == 'linux'",
-]
-
 [build-system]
 requires = ["setuptools>=70"]
 build-backend = "setuptools.build_meta"
@@ -35,22 +21,6 @@ dev = [
     "setuptools>=70",
 ]
 
-[tool.uv]
-default-groups = ["dev"]
-
-# nvidia and rocm both want to source torch from a different PyTorch
-# index, so they cannot be resolved together — declare them as a
-# conflicting extras pair.
-conflicts = [
-    [
-        { extra = "nvidia" },
-        { extra = "rocm" },
-    ],
-]
-# causal-conv1d's setup.py imports torch at build time to detect CUDA vs
-# HIP, so it needs the env's torch — not a fresh PEP-517 build env.
-no-build-isolation-package = ["causal-conv1d"]
-
 [tool.uv.sources]
 mojo-compiler = [
     { index = "modular-nightly" },
@@ -58,28 +28,10 @@ mojo-compiler = [
 mojo-compiler-mojo-libs = [
     { index = "modular-nightly" },
 ]
-torch = [
-    { index = "pytorch-cu128", extra = "nvidia" },
-    { index = "pytorch-rocm", extra = "rocm" },
-]
-# ROCm Triton ships on the same index as the ROCm torch wheels.
-pytorch-triton-rocm = [
-    { index = "pytorch-rocm", extra = "rocm" },
-]
 
 [[tool.uv.index]]
 name = "modular-nightly"
 url = "https://whl.modular.com/nightly/simple/"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-rocm"
-url = "https://download.pytorch.org/whl/rocm6.4"
 explicit = true
 
 [tool.setuptools.packages.find]
