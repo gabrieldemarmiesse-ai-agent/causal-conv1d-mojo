@@ -3,17 +3,11 @@ linear/non-circular state only, no state_indices)."""
 
 from std.gpu import block_idx, thread_idx
 from std.gpu.globals import MAX_THREADS_PER_BLOCK_METADATA
-from std.math import exp, recip
 from std.utils.index import StaticTuple
 
 
 comptime kNThreadsUpdate: Int = 64
 comptime dtype = DType.float16
-
-
-def _silu_f32(x: Float32) -> Float32:
-    """SiLU: `x * sigmoid(x)`, expressed as `x * recip(1 + exp(-x))`."""
-    return x * recip(Float32(1) + exp(-x))
 
 
 @__llvm_metadata(
@@ -64,6 +58,5 @@ def update_kernel(
     var x1: Scalar[accum_t] = x_val.cast[accum_t]()
 
     var out_val: Scalar[accum_t] = bias_v + w0 * x0 + w1 * x1
-    out_val = _silu_f32(Float32(out_val))
 
     out_lane[0] = out_val.cast[dtype]()
