@@ -39,10 +39,7 @@ def _objc() -> ctypes.CDLL:
 
 
 def gpu_address(t: torch.Tensor) -> int:
-    storage = t.untyped_storage()
-    buf_obj = storage.data_ptr()
-    if buf_obj == 0:
-        return 0
+    buf_obj = t.untyped_storage().data_ptr()
     libobjc = _objc()
     sel = libobjc.sel_registerName(b"gpuAddress")
     base_gpu = libobjc.objc_msgSend(buf_obj, sel)
