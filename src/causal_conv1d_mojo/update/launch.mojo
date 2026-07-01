@@ -5,13 +5,10 @@ from std.gpu.host import DeviceContext
 from std.gpu.host.device_context import _DeviceContextPtr, _DeviceContextCpp
 from std.math import ceildiv
 
-from kernel import kNThreadsUpdate, update_kernel
+from kernel import dtype, kNThreadsUpdate, update_kernel
 
 
-def launch_update[
-    dtype: DType,
-    width: Int,
-](
+def launch_update(
     batch_int: Int,
     dim_int: Int,
     seqlen_int: Int,
@@ -58,9 +55,7 @@ def launch_update[
         unsafe_from_address=o_addr
     )
 
-    var compiled = ctx.compile_function[
-        update_kernel[dtype, width]
-    ]()
+    var compiled = ctx.compile_function[update_kernel]()
     ctx.enqueue_function(
         compiled,
         Int32(dim_int),

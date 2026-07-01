@@ -1,17 +1,13 @@
-"""Static variant entry point for causal_conv1d_update (trimmed repro).
-Comptime params come from `-D` defines set by `_jit.py`.
+"""Static variant entry point for causal_conv1d_update (trimmed repro:
+dtype=float16, width=4 hardcoded in kernel.mojo, no -D defines needed).
 """
 
 from std.os import abort
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
-from std.sys import get_defined_dtype, get_defined_int
 
 from launch import launch_update
 from _ctx import acquire_ctx_handle
-
-comptime DTYPE = get_defined_dtype["DTYPE", DType.float32]()
-comptime WIDTH = get_defined_int["WIDTH"]()
 
 
 def causal_conv1d_update_acquire_ctx(
@@ -59,7 +55,7 @@ def causal_conv1d_update_variant(
     if batch_int == 0 or dim_int == 0:
         return PythonObject(None)
 
-    launch_update[DTYPE, WIDTH](
+    launch_update(
         batch_int,
         dim_int,
         seqlen_int,

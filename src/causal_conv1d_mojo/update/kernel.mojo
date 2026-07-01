@@ -10,15 +10,14 @@ from _silu import _silu_f32
 
 
 comptime kNThreadsUpdate: Int = 64
+comptime dtype = DType.float16
+comptime width: Int = 4
 
 
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(kNThreadsUpdate))
 )
-def update_kernel[
-    dtype: DType,
-    width: Int,
-](
+def update_kernel(
     dim: Int32,
     seqlen: Int32,
     state_len: Int32,
