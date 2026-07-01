@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from causal_conv1d_mojo._dtype import _DTYPE_CODE, _ptr
+from causal_conv1d_mojo._dtype import _DTYPE_CODE
 from causal_conv1d_mojo._mps import gpu_address, gpu_address_or_zero
 
 
