@@ -7,11 +7,6 @@ def _seed_rng():
     torch.manual_seed(0)
 
 
-@pytest.fixture(params=["mps"])
-def device(request):
-    return request.param
-
-
 @pytest.fixture(params=["silu"])
 def activation(request):
     return request.param
