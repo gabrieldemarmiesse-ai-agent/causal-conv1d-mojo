@@ -34,9 +34,7 @@ state = torch.randn(B, D, state_len, dtype=dtype, device=device)
 state_ours = state.clone()
 state_ref = state.clone()
 
-out_ours = causal_conv1d_mojo.causal_conv1d_update(
-    x, state_ours, weight, bias=bias, activation=activation
-)
+out_ours = causal_conv1d_mojo.causal_conv1d_update(x, state_ours, weight, bias)
 out_ref = causal_conv1d_update_ref(
     x, state_ref, weight, bias=bias, activation=activation
 )

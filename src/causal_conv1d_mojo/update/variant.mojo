@@ -46,11 +46,8 @@ def causal_conv1d_update_variant(
     var o_b_stride = Int32(py=args[16])
     var o_c_stride = Int32(py=args[17])
     var o_l_stride = Int32(py=args[18])
-    # args[19]=has_bias, args[20]=apply_silu (both unused now — always
-    # true in this trimmed repro), args[21]=dtype_code, args[22]=width
-    # are comptime defines, not read here.
-    # ctx_handle is appended as args[23] by call_update.
-    var ctx_handle_addr = Int(py=args[23])
+    # ctx_handle is appended as args[19] by call_update.
+    var ctx_handle_addr = Int(py=args[19])
 
     if batch_int == 0 or dim_int == 0:
         return PythonObject(None)

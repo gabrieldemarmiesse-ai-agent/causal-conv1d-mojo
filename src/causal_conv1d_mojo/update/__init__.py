@@ -4,17 +4,15 @@ from __future__ import annotations
 
 import torch
 
-from causal_conv1d_mojo._dtype import _DTYPE_CODE
-from causal_conv1d_mojo._mps import gpu_address, gpu_address_or_zero
+from causal_conv1d_mojo._mps import gpu_address
 
 
 def native_update_mps(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: torch.Tensor | None,
+    bias: torch.Tensor,
     conv_state: torch.Tensor,
     out: torch.Tensor,
-    apply_silu: bool,
 ) -> None:
     """torch MPS data_ptr is an Obj-C MTLBuffer pointer; extract Metal
     `gpuAddress` instead (see _mps.py)."""
@@ -25,7 +23,7 @@ def native_update_mps(
         (
             gpu_address(x),
             gpu_address(weight),
-            gpu_address_or_zero(bias),
+            gpu_address(bias),
             gpu_address(conv_state),
             gpu_address(out),
             x.shape[0],
@@ -42,9 +40,5 @@ def native_update_mps(
             out.stride(0),
             out.stride(1),
             out.stride(2),
-            int(bias is not None),
-            int(apply_silu),
-            _DTYPE_CODE[x.dtype],
-            weight.shape[1],
         )
     )
