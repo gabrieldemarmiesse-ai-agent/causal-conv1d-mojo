@@ -18,6 +18,7 @@ from _helpers import _FWD_TOL, _max_diff
 
 
 def test_update_single_token():
+    torch.manual_seed(0)
     device = "mps"
     activation = "silu"
     dtype = torch.float16
