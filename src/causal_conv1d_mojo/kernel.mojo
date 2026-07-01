@@ -23,7 +23,6 @@ def _silu_f32(x: Float32) -> Float32:
 )
 def update_kernel(
     dim: Int32,
-    seqlen: Int32,
     state_len: Int32,
     x_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     w_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
@@ -32,14 +31,12 @@ def update_kernel(
     o_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     x_b_stride: Int32,
     x_c_stride: Int32,
-    x_l_stride: Int32,
     w_c_stride: Int32,
     state_b_stride: Int32,
     state_c_stride: Int32,
     state_l_stride: Int32,
     o_b_stride: Int32,
     o_c_stride: Int32,
-    o_l_stride: Int32,
 ):
     comptime accum_t = DType.float32
 

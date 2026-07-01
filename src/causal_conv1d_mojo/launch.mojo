@@ -11,7 +11,6 @@ from kernel import dtype, kNThreadsUpdate, update_kernel
 def launch_update(
     batch_int: Int,
     dim_int: Int,
-    seqlen_int: Int,
     state_len_int: Int,
     x_addr: Int,
     w_addr: Int,
@@ -20,14 +19,12 @@ def launch_update(
     o_addr: Int,
     x_b_stride: Int32,
     x_c_stride: Int32,
-    x_l_stride: Int32,
     w_c_stride: Int32,
     state_b_stride: Int32,
     state_c_stride: Int32,
     state_l_stride: Int32,
     o_b_stride: Int32,
     o_c_stride: Int32,
-    o_l_stride: Int32,
     ctx_handle_addr: Int,
 ) raises:
     # Reconstruct a non-owning DeviceContext from the cached handle —
@@ -59,7 +56,6 @@ def launch_update(
     ctx.enqueue_function(
         compiled,
         Int32(dim_int),
-        Int32(seqlen_int),
         Int32(state_len_int),
         x_ptr,
         w_ptr,
@@ -68,14 +64,12 @@ def launch_update(
         o_ptr,
         x_b_stride,
         x_c_stride,
-        x_l_stride,
         w_c_stride,
         state_b_stride,
         state_c_stride,
         state_l_stride,
         o_b_stride,
         o_c_stride,
-        o_l_stride,
         grid_dim=grid,
         block_dim=(kNThreadsUpdate,),
     )
