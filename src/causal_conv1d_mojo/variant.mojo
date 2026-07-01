@@ -1,6 +1,5 @@
-"""Static variant entry point for causal_conv1d_update (trimmed repro:
-dtype=float16, width=4 hardcoded in kernel.mojo, no -D defines needed).
-"""
+"""Python entry point for the repro kernel. dtype/dim/batch are all
+comptime-fixed in kernel.mojo, so this only takes two GPU addresses."""
 
 from std.gpu.host import DeviceContext
 from std.os import abort
