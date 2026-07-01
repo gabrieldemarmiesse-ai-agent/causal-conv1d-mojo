@@ -5,14 +5,13 @@ Comptime params come from `-D` defines set by `_jit.py`.
 from std.os import abort
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
-from std.sys import get_defined_bool, get_defined_dtype, get_defined_int
+from std.sys import get_defined_dtype, get_defined_int
 
 from launch import launch_update
 from _ctx import acquire_ctx_handle
 
 comptime DTYPE = get_defined_dtype["DTYPE", DType.float32]()
 comptime WIDTH = get_defined_int["WIDTH"]()
-comptime APPLY_SILU = get_defined_bool["APPLY_SILU"]()
 
 
 def causal_conv1d_update_acquire_ctx(
@@ -51,8 +50,8 @@ def causal_conv1d_update_variant(
     var o_b_stride = Int32(py=args[16])
     var o_c_stride = Int32(py=args[17])
     var o_l_stride = Int32(py=args[18])
-    # args[19]=has_bias (unused, bias is always present in this trimmed
-    # repro), args[20]=apply_silu, args[21]=dtype_code, args[22]=width
+    # args[19]=has_bias, args[20]=apply_silu (both unused now — always
+    # true in this trimmed repro), args[21]=dtype_code, args[22]=width
     # are comptime defines, not read here.
     # ctx_handle is appended as args[23] by call_update.
     var ctx_handle_addr = Int(py=args[23])
@@ -60,7 +59,7 @@ def causal_conv1d_update_variant(
     if batch_int == 0 or dim_int == 0:
         return PythonObject(None)
 
-    launch_update[DTYPE, WIDTH, APPLY_SILU](
+    launch_update[DTYPE, WIDTH](
         batch_int,
         dim_int,
         seqlen_int,

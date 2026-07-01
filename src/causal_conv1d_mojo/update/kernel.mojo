@@ -18,7 +18,6 @@ comptime kNThreadsUpdate: Int = 64
 def update_kernel[
     dtype: DType,
     width: Int,
-    apply_silu: Bool,
 ](
     dim: Int32,
     seqlen: Int32,
@@ -111,8 +110,7 @@ def update_kernel[
         comptime for k in range(width):
             out_val += weights[k] * x_vals[k]
 
-        comptime if apply_silu:
-            out_val = _silu_f32(Float32(out_val))
+        out_val = _silu_f32(Float32(out_val))
 
         out_lane[Int(i * o_l_stride)] = out_val.cast[dtype]()
 
