@@ -2,17 +2,12 @@
 linear/non-circular state only, no state_indices)."""
 
 from std.gpu import block_idx, thread_idx
-from std.gpu.globals import MAX_THREADS_PER_BLOCK_METADATA
-from std.utils.index import StaticTuple
 
 
 comptime kNThreadsUpdate: Int = 16
 comptime dtype = DType.float16
 
 
-@__llvm_metadata(
-    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(kNThreadsUpdate))
-)
 def update_kernel(
     dim: Int32,
     x_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
