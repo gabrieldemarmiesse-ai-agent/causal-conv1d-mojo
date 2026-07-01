@@ -30,13 +30,11 @@ def causal_conv1d_update_variant(
     mut args: PythonObject,
 ) raises -> PythonObject:
     var x_addr = Int(py=args[0])
-    var w_addr = Int(py=args[1])
-    var state_addr = Int(py=args[2])
-    var o_addr = Int(py=args[3])
-    var batch_int = Int(py=args[4])
-    var dim_int = Int(py=args[5])
-    # ctx_handle is appended as args[6] by call_update.
-    var ctx_handle_addr = Int(py=args[6])
+    var o_addr = Int(py=args[1])
+    var batch_int = Int(py=args[2])
+    var dim_int = Int(py=args[3])
+    # ctx_handle is appended as args[4] by call_update.
+    var ctx_handle_addr = Int(py=args[4])
 
     # Reconstruct a non-owning DeviceContext from the cached handle —
     # avoids creating a fresh DeviceContext (and its stream) every call.
@@ -50,12 +48,6 @@ def causal_conv1d_update_variant(
     var x_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
         unsafe_from_address=x_addr
     )
-    var w_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
-        unsafe_from_address=w_addr
-    )
-    var state_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
-        unsafe_from_address=state_addr
-    )
     var o_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
         unsafe_from_address=o_addr
     )
@@ -65,8 +57,6 @@ def causal_conv1d_update_variant(
         compiled,
         Int32(dim_int),
         x_ptr,
-        w_ptr,
-        state_ptr,
         o_ptr,
         grid_dim=grid,
         block_dim=(kNThreadsUpdate,),

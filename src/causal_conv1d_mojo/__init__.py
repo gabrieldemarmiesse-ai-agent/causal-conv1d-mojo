@@ -70,28 +70,17 @@ def _get_variant_fn():
     return fn, ctx_handle
 
 
-def causal_conv1d_update(
-    x: torch.Tensor,
-    conv_state: torch.Tensor,
-    weight: torch.Tensor,
-) -> torch.Tensor:
-    unsqueeze = x.dim() == 2
-    if unsqueeze:
-        x = x.unsqueeze(-1)
+def causal_conv1d_update(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
 
     torch.mps.synchronize()
     variant_fn, ctx_handle = _get_variant_fn()
     variant_fn(
         gpu_address(x),
-        gpu_address(weight),
-        gpu_address(conv_state),
         gpu_address(out),
         x.shape[0],
         x.shape[1],
         ctx_handle,
     )
 
-    if unsqueeze:
-        out = out.squeeze(-1)
     return out
