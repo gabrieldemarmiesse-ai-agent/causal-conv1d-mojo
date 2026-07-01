@@ -32,16 +32,7 @@ build-backend = "setuptools.build_meta"
 
 [dependency-groups]
 dev = [
-    "matplotlib>=3.10.9",
-    "pytest>=9.0.3",
-    "ruff",
-    "pre-commit",
-    "wheel",
-    "packaging",
     "setuptools>=70",
-    "numpy>=2.0.0",
-    "tomli-w",
-    "pytest-xdist>=3.8.0",
 ]
 
 [tool.uv]
@@ -97,20 +88,6 @@ where = ["src"]
 [tool.setuptools.package-data]
 "causal_conv1d_mojo" = ["**/*.mojo"]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-filterwarnings = [
-    # Surface any warning as a test failure. Beartype's PEP-585
-    # deprecation warnings are the most common cause when something
-    # regresses (e.g. importing `typing.Mapping` instead of
-    # `collections.abc.Mapping`), but we want any unexpected warning
-    # to fail the suite, not silently scroll past.
-    "error",
-    # torch.compile/dynamo internally instantiates autograd.Function
-    # subclasses while tracing, which raises a self-deprecation
-    # warning from torch itself. Not under our control; ignore.
-    "ignore:.*should not be instantiated.*:DeprecationWarning",
-]
 
 [tool.ruff]
 target-version = "py313"
