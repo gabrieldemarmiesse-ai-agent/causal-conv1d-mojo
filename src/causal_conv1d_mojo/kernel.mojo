@@ -65,11 +65,10 @@ def update_kernel(
     var bias_v: Scalar[accum_t] = bias_ptr[Int(channel_id)].cast[accum_t]()
 
     var sl: Int32 = state_len
-    var advance_len: Int32 = seqlen
     var x_vals = SIMD[accum_t, width](0)
 
-    # Phase 2: read trailing W-1 history into x_vals (with writeback for
-    # the small-state_len edge case).
+    # Phase 2: read trailing W-1 history into x_vals (seqlen is always 1
+    # for this repro, so the write-back always applies to i in [1, W-1)).
     var state_vals = SIMD[dtype, width - 1](0)
     var s_vec = state_lane.load[width = width - 1, alignment=2](
         Int((sl - Int32(width - 1)) * state_l_stride)
@@ -78,13 +77,12 @@ def update_kernel(
         state_vals[i] = s_vec[i]
 
     comptime for i in range(width - 1):
-        var write_idx: Int32 = sl - advance_len - Int32(width - 1) + Int32(i)
-        if Int32(i) < advance_len + Int32(width - 1) and write_idx >= 0:
+        var write_idx: Int32 = sl - Int32(width) + Int32(i)
+        if write_idx >= 0:
             state_lane[Int(write_idx * state_l_stride)] = state_vals[i]
         x_vals[i] = state_vals[i].cast[accum_t]()
 
-    # Phase 3: consume the single new x (seqlen is always 1 for this
-    # repro), write into state, emit output.
+    # Phase 3: consume the single new x, write into state, emit output.
     var x_val = x_lane[0]
     state_lane[Int((sl - Int32(1)) * state_l_stride)] = x_val
     x_vals[width - 1] = x_val.cast[accum_t]()
