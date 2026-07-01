@@ -3,15 +3,19 @@ linear/non-circular state only, no state_indices)."""
 
 from std.gpu import block_idx, thread_idx
 from std.gpu.globals import MAX_THREADS_PER_BLOCK_METADATA
+from std.math import exp, recip
 from std.sys import size_of
 from std.utils.index import StaticTuple
-
-from _silu import _silu_f32
 
 
 comptime kNThreadsUpdate: Int = 64
 comptime dtype = DType.float16
 comptime width: Int = 4
+
+
+def _silu_f32(x: Float32) -> Float32:
+    """SiLU: `x * sigmoid(x)`, expressed as `x * recip(1 + exp(-x))`."""
+    return x * recip(Float32(1) + exp(-x))
 
 
 @__llvm_metadata(
