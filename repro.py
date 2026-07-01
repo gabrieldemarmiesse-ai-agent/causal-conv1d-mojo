@@ -16,8 +16,7 @@ import causal_conv1d_mojo
 torch.manual_seed(0)
 device = "mps"
 dtype = torch.float16
-B, D = 2, 16
-x = torch.randn(B, D, dtype=dtype, device=device)
+x = torch.randn(1, dtype=dtype, device=device)
 
 out = causal_conv1d_mojo.causal_conv1d_update(x)
 
