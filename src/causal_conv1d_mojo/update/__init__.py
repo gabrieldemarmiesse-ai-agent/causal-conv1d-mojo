@@ -13,15 +13,11 @@ def native_update_mps(
     weight: torch.Tensor,
     bias: torch.Tensor | None,
     conv_state: torch.Tensor,
-    state_indices: torch.Tensor | None,
-    cache_seqlens: torch.Tensor | None,
     out: torch.Tensor,
     apply_silu: bool,
 ) -> None:
-    """Mac/MPS path — see `fwd/__init__.py::native_fwd_mps` for the
-    rationale (torch MPS data_ptr is an Obj-C MTLBuffer pointer; we
-    extract Metal `gpuAddress` instead, and pass `stream_handle=0`).
-    """
+    """torch MPS data_ptr is an Obj-C MTLBuffer pointer; extract Metal
+    `gpuAddress` instead (see _mps.py)."""
     from causal_conv1d_mojo.update._jit import call_update
 
     torch.mps.synchronize()
@@ -52,10 +48,10 @@ def native_update_mps(
             _DTYPE_CODE[x.dtype],
             0,  # stream_handle_addr — Metal has no streams
             weight.shape[1],
-            int(state_indices is not None),
-            gpu_address_or_zero(state_indices),
-            int(cache_seqlens is not None),
-            gpu_address_or_zero(cache_seqlens),
+            0,  # has_state_indices (always false in this trimmed repro)
+            0,  # state_indices_addr
+            0,  # has_cache_seqlens (always false in this trimmed repro)
+            0,  # cache_seqlens_addr
             0,  # use_external_stream: Metal path enqueues on ctx
         )
     )
