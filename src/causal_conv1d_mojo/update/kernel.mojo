@@ -57,13 +57,9 @@ def update_kernel[
     var w_lane = w_ptr + Int(channel_id * w_c_stride)
 
     var weights = SIMD[accum_t, width](0)
-    comptime if width == 2 or width == 4:
-        var w_vec = w_lane.load[width=width, alignment = size_of[dtype]() * width](0)
-        comptime for k in range(width):
-            weights[k] = w_vec[k].cast[accum_t]()
-    else:
-        comptime for k in range(width):
-            weights[k] = w_lane.load(k).cast[accum_t]()
+    var w_vec = w_lane.load[width=width, alignment = size_of[dtype]() * width](0)
+    comptime for k in range(width):
+        weights[k] = w_vec[k].cast[accum_t]()
 
     var bias_v: Scalar[accum_t] = 0
     comptime if has_bias:
