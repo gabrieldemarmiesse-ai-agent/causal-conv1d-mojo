@@ -10,7 +10,7 @@ from std.utils.index import StaticTuple
 
 comptime kNThreadsUpdate: Int = 64
 comptime dtype = DType.float16
-comptime width: Int = 4
+comptime width: Int = 2
 
 
 def _silu_f32(x: Float32) -> Float32:

@@ -16,7 +16,7 @@ import causal_conv1d_mojo
 torch.manual_seed(0)
 device = "mps"
 dtype = torch.float16
-width = 4
+width = 2
 B, D = 2, 16
 state_len = width - 1
 x = torch.randn(B, D, dtype=dtype, device=device)
