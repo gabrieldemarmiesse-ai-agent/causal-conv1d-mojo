@@ -11,7 +11,6 @@ from kernel import dtype, kNThreadsUpdate, update_kernel
 def launch_update(
     batch_int: Int,
     dim_int: Int,
-    state_len_int: Int,
     x_addr: Int,
     w_addr: Int,
     b_addr: Int,
@@ -22,7 +21,6 @@ def launch_update(
     w_c_stride: Int32,
     state_b_stride: Int32,
     state_c_stride: Int32,
-    state_l_stride: Int32,
     o_b_stride: Int32,
     o_c_stride: Int32,
     ctx_handle_addr: Int,
@@ -56,7 +54,6 @@ def launch_update(
     ctx.enqueue_function(
         compiled,
         Int32(dim_int),
-        Int32(state_len_int),
         x_ptr,
         w_ptr,
         b_ptr,
@@ -67,7 +64,6 @@ def launch_update(
         w_c_stride,
         state_b_stride,
         state_c_stride,
-        state_l_stride,
         o_b_stride,
         o_c_stride,
         grid_dim=grid,
