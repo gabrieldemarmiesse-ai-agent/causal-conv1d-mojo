@@ -17,10 +17,11 @@ from causal_conv1d_mojo import causal_conv1d_update_ref
 from _helpers import _FWD_TOL, _max_diff
 
 
-def test_update_single_token(width):
+def test_update_single_token():
     device = "mps"
     activation = "silu"
     dtype = torch.float16
+    width = 4
     B, D = 2, 16
     state_len = width - 1
     x = torch.randn(B, D, dtype=dtype, device=device)
