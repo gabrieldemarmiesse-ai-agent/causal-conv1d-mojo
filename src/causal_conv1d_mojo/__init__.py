@@ -64,21 +64,17 @@ def _get_variant_fn():
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
 
-    fn = module.causal_conv1d_update_variant
-    acquire = module.causal_conv1d_update_acquire_ctx
-    ctx_handle = int(acquire(()))
-    return fn, ctx_handle
+    return module.causal_conv1d_update_variant
 
 
 def causal_conv1d_update(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
 
     torch.mps.synchronize()
-    variant_fn, ctx_handle = _get_variant_fn()
+    variant_fn = _get_variant_fn()
     variant_fn(
         gpu_address(x),
         gpu_address(out),
-        ctx_handle,
     )
 
     return out
