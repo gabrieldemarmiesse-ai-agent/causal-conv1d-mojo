@@ -17,20 +17,12 @@ dependencies = [
     { name = "torch" },
 ]
 
-[package.dev-dependencies]
-dev = [
-    { name = "setuptools" },
-]
-
 [package.metadata]
 requires-dist = [
     { name = "mojo-compiler", specifier = "==1.0.0b3.dev2026062306", index = "https://whl.modular.com/nightly/simple/" },
     { name = "mojo-compiler-mojo-libs", specifier = "==1.0.0b3.dev2026062306", index = "https://whl.modular.com/nightly/simple/" },
     { name = "torch", specifier = ">=2,<3" },
 ]
-
-[package.metadata.requires-dev]
-dev = [{ name = "setuptools", specifier = ">=70" }]
 
 [[package]]
 name = "filelock"

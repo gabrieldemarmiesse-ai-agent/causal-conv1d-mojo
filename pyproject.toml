@@ -16,11 +16,6 @@ dependencies = [
 requires = ["setuptools>=70"]
 build-backend = "setuptools.build_meta"
 
-[dependency-groups]
-dev = [
-    "setuptools>=70",
-]
-
 [tool.uv.sources]
 mojo-compiler = [
     { index = "modular-nightly" },
@@ -39,12 +34,3 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "causal_conv1d_mojo" = ["**/*.mojo"]
-
-
-[tool.ruff]
-target-version = "py313"
-
-[tool.ruff.lint]
-# E741: "ambiguous variable name `l`" — `l` is conventional for seqlen
-# in ML code (matches upstream causal_conv1d). Same for `B`, `D`, etc.
-ignore = ["E741"]
