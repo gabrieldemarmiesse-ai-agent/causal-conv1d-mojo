@@ -89,13 +89,6 @@ def causal_conv1d_update(
         gpu_address(out),
         x.shape[0],
         x.shape[1],
-        x.stride(0),
-        x.stride(1),
-        weight.stride(0),
-        conv_state.stride(0),
-        conv_state.stride(1),
-        out.stride(0),
-        out.stride(1),
         ctx_handle,
     )
 

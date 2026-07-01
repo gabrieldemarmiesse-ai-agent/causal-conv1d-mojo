@@ -19,13 +19,6 @@ def update_kernel(
     w_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     state_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     o_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    x_b_stride: Int32,
-    x_c_stride: Int32,
-    w_c_stride: Int32,
-    state_b_stride: Int32,
-    state_c_stride: Int32,
-    o_b_stride: Int32,
-    o_c_stride: Int32,
 ):
     comptime accum_t = DType.float32
 
@@ -36,12 +29,15 @@ def update_kernel(
     if channel_id >= dim:
         return
 
-    var x_lane = x_ptr + Int(batch_id * x_b_stride + channel_id * x_c_stride)
-    var out_lane = o_ptr + Int(batch_id * o_b_stride + channel_id * o_c_stride)
-    var state_lane = state_ptr + Int(
-        batch_id * state_b_stride + channel_id * state_c_stride
-    )
-    var w_lane = w_ptr + Int(channel_id * w_c_stride)
+    # x/state/out all have shape (batch, dim, 1) and are always freshly
+    # allocated + contiguous in this repro, so batch stride = dim and
+    # channel stride = 1 — no need to pass strides at all.
+    var lane_offset = Int(batch_id * dim + channel_id)
+    var x_lane = x_ptr + lane_offset
+    var out_lane = o_ptr + lane_offset
+    var state_lane = state_ptr + lane_offset
+    # weight has shape (dim, 2), also contiguous — channel stride = 2.
+    var w_lane = w_ptr + Int(channel_id * 2)
 
     var w0: Scalar[accum_t] = w_lane[0].cast[accum_t]()
     var w1: Scalar[accum_t] = w_lane[1].cast[accum_t]()

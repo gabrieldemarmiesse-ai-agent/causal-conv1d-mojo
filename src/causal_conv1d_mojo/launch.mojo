@@ -15,13 +15,6 @@ def launch_update(
     w_addr: Int,
     state_addr: Int,
     o_addr: Int,
-    x_b_stride: Int32,
-    x_c_stride: Int32,
-    w_c_stride: Int32,
-    state_b_stride: Int32,
-    state_c_stride: Int32,
-    o_b_stride: Int32,
-    o_c_stride: Int32,
     ctx_handle_addr: Int,
 ) raises:
     # Reconstruct a non-owning DeviceContext from the cached handle —
@@ -54,13 +47,6 @@ def launch_update(
         w_ptr,
         state_ptr,
         o_ptr,
-        x_b_stride,
-        x_c_stride,
-        w_c_stride,
-        state_b_stride,
-        state_c_stride,
-        o_b_stride,
-        o_c_stride,
         grid_dim=grid,
         block_dim=(kNThreadsUpdate,),
     )
