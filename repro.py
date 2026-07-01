@@ -2,7 +2,7 @@
 all-zero output the very first time a fresh mojo build's kernel is
 dispatched, when `~/.cache/modular`'s Mojo transform cache is cold.
 
-    rm -rf ~/.cache/causal_conv1d_mojo && mojo --clear-cache -f
+    mojo --clear-cache -f
     uv run python repro.py
 
 FAILS every time on a cold cache; passes if you run it again (cache now
