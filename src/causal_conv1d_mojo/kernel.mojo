@@ -9,7 +9,6 @@ from std.utils.index import StaticTuple
 
 comptime kNThreadsUpdate: Int = 64
 comptime dtype = DType.float16
-comptime width: Int = 2
 
 
 def _silu_f32(x: Float32) -> Float32:
@@ -51,27 +50,20 @@ def update_kernel(
     )
     var w_lane = w_ptr + Int(channel_id * w_c_stride)
 
-    var weights = SIMD[accum_t, width](0)
-    comptime for k in range(width):
-        weights[k] = w_lane[k].cast[accum_t]()
-
+    var w0: Scalar[accum_t] = w_lane[0].cast[accum_t]()
+    var w1: Scalar[accum_t] = w_lane[1].cast[accum_t]()
     var bias_v: Scalar[accum_t] = bias_ptr[Int(channel_id)].cast[accum_t]()
-
-    var x_vals = SIMD[accum_t, width](0)
 
     # Phase 2: read the single history value (state_len is always
     # width-1=1 for this repro, so there's exactly one).
-    var state_val = state_lane[0]
-    x_vals[0] = state_val.cast[accum_t]()
+    var x0: Scalar[accum_t] = state_lane[0].cast[accum_t]()
 
     # Phase 3: consume the single new x, write into state, emit output.
     var x_val = x_lane[0]
     state_lane[0] = x_val
-    x_vals[width - 1] = x_val.cast[accum_t]()
+    var x1: Scalar[accum_t] = x_val.cast[accum_t]()
 
-    var out_val: Scalar[accum_t] = bias_v
-    comptime for k in range(width):
-        out_val += weights[k] * x_vals[k]
+    var out_val: Scalar[accum_t] = bias_v + w0 * x0 + w1 * x1
     out_val = _silu_f32(Float32(out_val))
 
     out_lane[0] = out_val.cast[dtype]()
