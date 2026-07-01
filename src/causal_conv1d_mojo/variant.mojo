@@ -30,20 +30,19 @@ def causal_conv1d_update_variant(
 ) raises -> PythonObject:
     var x_addr = Int(py=args[0])
     var w_addr = Int(py=args[1])
-    var b_addr = Int(py=args[2])
-    var state_addr = Int(py=args[3])
-    var o_addr = Int(py=args[4])
-    var batch_int = Int(py=args[5])
-    var dim_int = Int(py=args[6])
-    var x_b_stride = Int32(py=args[7])
-    var x_c_stride = Int32(py=args[8])
-    var w_c_stride = Int32(py=args[9])
-    var state_b_stride = Int32(py=args[10])
-    var state_c_stride = Int32(py=args[11])
-    var o_b_stride = Int32(py=args[12])
-    var o_c_stride = Int32(py=args[13])
-    # ctx_handle is appended as args[14] by call_update.
-    var ctx_handle_addr = Int(py=args[14])
+    var state_addr = Int(py=args[2])
+    var o_addr = Int(py=args[3])
+    var batch_int = Int(py=args[4])
+    var dim_int = Int(py=args[5])
+    var x_b_stride = Int32(py=args[6])
+    var x_c_stride = Int32(py=args[7])
+    var w_c_stride = Int32(py=args[8])
+    var state_b_stride = Int32(py=args[9])
+    var state_c_stride = Int32(py=args[10])
+    var o_b_stride = Int32(py=args[11])
+    var o_c_stride = Int32(py=args[12])
+    # ctx_handle is appended as args[13] by call_update.
+    var ctx_handle_addr = Int(py=args[13])
 
     if batch_int == 0 or dim_int == 0:
         return PythonObject(None)
@@ -53,7 +52,6 @@ def causal_conv1d_update_variant(
         dim_int,
         x_addr,
         w_addr,
-        b_addr,
         state_addr,
         o_addr,
         x_b_stride,

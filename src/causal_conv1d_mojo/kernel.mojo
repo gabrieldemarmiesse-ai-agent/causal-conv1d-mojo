@@ -17,7 +17,6 @@ def update_kernel(
     dim: Int32,
     x_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     w_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    bias_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     state_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     o_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     x_b_stride: Int32,
@@ -46,7 +45,6 @@ def update_kernel(
 
     var w0: Scalar[accum_t] = w_lane[0].cast[accum_t]()
     var w1: Scalar[accum_t] = w_lane[1].cast[accum_t]()
-    var bias_v: Scalar[accum_t] = bias_ptr[Int(channel_id)].cast[accum_t]()
 
     # Phase 2: read the single history value (state_len is always
     # width-1=1 for this repro, so there's exactly one).
@@ -57,6 +55,6 @@ def update_kernel(
     state_lane[0] = x_val
     var x1: Scalar[accum_t] = x_val.cast[accum_t]()
 
-    var out_val: Scalar[accum_t] = bias_v + w0 * x0 + w1 * x1
+    var out_val: Scalar[accum_t] = w0 * x0 + w1 * x1
 
     out_lane[0] = out_val.cast[dtype]()

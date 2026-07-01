@@ -21,10 +21,9 @@ B, D = 2, 16
 state_len = width - 1
 x = torch.randn(B, D, dtype=dtype, device=device)
 weight = torch.randn(D, width, dtype=dtype, device=device)
-bias = torch.randn(D, dtype=dtype, device=device)
 state = torch.randn(B, D, state_len, dtype=dtype, device=device)
 
-out = causal_conv1d_mojo.causal_conv1d_update(x, state, weight, bias)
+out = causal_conv1d_mojo.causal_conv1d_update(x, state, weight)
 
 print("out:", out)
 max_abs = out.abs().max().item()

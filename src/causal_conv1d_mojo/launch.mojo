@@ -13,7 +13,6 @@ def launch_update(
     dim_int: Int,
     x_addr: Int,
     w_addr: Int,
-    b_addr: Int,
     state_addr: Int,
     o_addr: Int,
     x_b_stride: Int32,
@@ -40,9 +39,6 @@ def launch_update(
     var w_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
         unsafe_from_address=w_addr
     )
-    var b_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
-        unsafe_from_address=b_addr
-    )
     var state_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
         unsafe_from_address=state_addr
     )
@@ -56,7 +52,6 @@ def launch_update(
         Int32(dim_int),
         x_ptr,
         w_ptr,
-        b_ptr,
         state_ptr,
         o_ptr,
         x_b_stride,

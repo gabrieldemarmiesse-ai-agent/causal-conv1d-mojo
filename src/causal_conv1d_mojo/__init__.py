@@ -74,7 +74,6 @@ def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
     weight: torch.Tensor,
-    bias: torch.Tensor,
 ) -> torch.Tensor:
     unsqueeze = x.dim() == 2
     if unsqueeze:
@@ -86,7 +85,6 @@ def causal_conv1d_update(
     variant_fn(
         gpu_address(x),
         gpu_address(weight),
-        gpu_address(bias),
         gpu_address(conv_state),
         gpu_address(out),
         x.shape[0],
