@@ -79,7 +79,6 @@ def causal_conv1d_update(x: torch.Tensor) -> torch.Tensor:
         gpu_address(x),
         gpu_address(out),
         x.shape[0],
-        x.shape[1],
         ctx_handle,
     )
 

@@ -11,18 +11,19 @@ comptime dtype = DType.float16
 
 
 def update_kernel(
-    dim: Int32,
     x_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     o_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
 ):
     # kNThreadsUpdate == dim (16, the repro's fixed D) exactly, so a
     # single block dimension covers the whole channel range — no
-    # block_idx.y and no bounds check needed.
-    var batch_id: Int32 = Int32(block_idx.x)
-    var channel_id: Int32 = Int32(thread_idx.x)
+    # block_idx.y and no bounds check needed. dim is comptime-fixed too
+    # (the repro always uses D=16), so it never needs to cross the
+    # Python/Mojo boundary as a runtime value.
+    var batch_id = Int(block_idx.x)
+    var channel_id = Int(thread_idx.x)
 
     # x/out both have shape (batch, dim) and are always freshly allocated
     # + contiguous in this repro, so batch stride = dim and channel
     # stride = 1 — no need to pass strides at all.
-    var lane_offset = Int(batch_id * dim + channel_id)
+    var lane_offset = batch_id * kNThreadsUpdate + channel_id
     o_ptr[lane_offset] = x_ptr[lane_offset]

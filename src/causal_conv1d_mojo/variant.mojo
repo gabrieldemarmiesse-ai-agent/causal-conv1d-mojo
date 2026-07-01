@@ -32,9 +32,8 @@ def causal_conv1d_update_variant(
     var x_addr = Int(py=args[0])
     var o_addr = Int(py=args[1])
     var batch_int = Int(py=args[2])
-    var dim_int = Int(py=args[3])
-    # ctx_handle is appended as args[4] by call_update.
-    var ctx_handle_addr = Int(py=args[4])
+    # ctx_handle is appended as args[3] by call_update.
+    var ctx_handle_addr = Int(py=args[3])
 
     # Reconstruct a non-owning DeviceContext from the cached handle —
     # avoids creating a fresh DeviceContext (and its stream) every call.
@@ -55,7 +54,6 @@ def causal_conv1d_update_variant(
     var compiled = ctx.compile_function[update_kernel]()
     ctx.enqueue_function(
         compiled,
-        Int32(dim_int),
         x_ptr,
         o_ptr,
         grid_dim=grid,
