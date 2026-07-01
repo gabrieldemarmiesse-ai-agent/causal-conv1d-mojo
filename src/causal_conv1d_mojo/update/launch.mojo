@@ -11,7 +11,6 @@ from kernel import kNThreadsUpdate, update_kernel
 def launch_update[
     dtype: DType,
     width: Int,
-    has_bias: Bool,
     apply_silu: Bool,
 ](
     batch_int: Int,
@@ -61,7 +60,7 @@ def launch_update[
     )
 
     var compiled = ctx.compile_function[
-        update_kernel[dtype, width, has_bias, apply_silu]
+        update_kernel[dtype, width, apply_silu]
     ]()
     ctx.enqueue_function(
         compiled,

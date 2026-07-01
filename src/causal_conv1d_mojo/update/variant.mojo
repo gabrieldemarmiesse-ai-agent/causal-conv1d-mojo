@@ -12,7 +12,6 @@ from _ctx import acquire_ctx_handle
 
 comptime DTYPE = get_defined_dtype["DTYPE", DType.float32]()
 comptime WIDTH = get_defined_int["WIDTH"]()
-comptime HAS_BIAS = get_defined_bool["HAS_BIAS"]()
 comptime APPLY_SILU = get_defined_bool["APPLY_SILU"]()
 
 
@@ -52,15 +51,16 @@ def causal_conv1d_update_variant(
     var o_b_stride = Int32(py=args[16])
     var o_c_stride = Int32(py=args[17])
     var o_l_stride = Int32(py=args[18])
-    # args[19]=has_bias, args[20]=apply_silu, args[21]=dtype_code,
-    # args[22]=width are comptime defines, not read here.
+    # args[19]=has_bias (unused, bias is always present in this trimmed
+    # repro), args[20]=apply_silu, args[21]=dtype_code, args[22]=width
+    # are comptime defines, not read here.
     # ctx_handle is appended as args[23] by call_update.
     var ctx_handle_addr = Int(py=args[23])
 
     if batch_int == 0 or dim_int == 0:
         return PythonObject(None)
 
-    launch_update[DTYPE, WIDTH, HAS_BIAS, APPLY_SILU](
+    launch_update[DTYPE, WIDTH, APPLY_SILU](
         batch_int,
         dim_int,
         seqlen_int,

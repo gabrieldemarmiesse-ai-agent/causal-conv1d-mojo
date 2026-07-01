@@ -18,7 +18,6 @@ comptime kNThreadsUpdate: Int = 64
 def update_kernel[
     dtype: DType,
     width: Int,
-    has_bias: Bool,
     apply_silu: Bool,
 ](
     dim: Int32,
@@ -61,9 +60,7 @@ def update_kernel[
     comptime for k in range(width):
         weights[k] = w_vec[k].cast[accum_t]()
 
-    var bias_v: Scalar[accum_t] = 0
-    comptime if has_bias:
-        bias_v = bias_ptr[Int(channel_id)].cast[accum_t]()
+    var bias_v: Scalar[accum_t] = bias_ptr[Int(channel_id)].cast[accum_t]()
 
     var sl: Int32 = state_len
     var advance_len: Int32 = seqlen

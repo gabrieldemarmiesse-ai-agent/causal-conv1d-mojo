@@ -26,18 +26,17 @@ def _config_from_args(args: tuple) -> tuple:
     return (
         args[21],  # dtype_code
         args[22],  # width
-        bool(args[19]),  # has_bias
         bool(args[20]),  # apply_silu
     )
 
 
 def _mod_name(config: tuple) -> str:
-    (dt, w, hb, silu) = config
-    return f"{_DTYPE_NAME[dt]}_w{w}_hb{int(hb)}_silu{int(silu)}"
+    (dt, w, silu) = config
+    return f"{_DTYPE_NAME[dt]}_w{w}_silu{int(silu)}"
 
 
 def _defines(config: tuple) -> dict[str, str]:
-    (dt, w, hb, silu) = config
+    (dt, w, silu) = config
 
     def b(x: bool) -> str:
         return "true" if x else "false"
@@ -45,7 +44,6 @@ def _defines(config: tuple) -> dict[str, str]:
     return {
         "DTYPE": _DTYPE_DEFINE[dt],
         "WIDTH": str(w),
-        "HAS_BIAS": b(hb),
         "APPLY_SILU": b(silu),
     }
 
