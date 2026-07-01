@@ -4,7 +4,6 @@ linear/non-circular state only, no state_indices)."""
 from std.gpu import block_idx, thread_idx
 from std.gpu.globals import MAX_THREADS_PER_BLOCK_METADATA
 from std.math import exp, recip
-from std.sys import size_of
 from std.utils.index import StaticTuple
 
 
@@ -53,9 +52,8 @@ def update_kernel(
     var w_lane = w_ptr + Int(channel_id * w_c_stride)
 
     var weights = SIMD[accum_t, width](0)
-    var w_vec = w_lane.load[width=width, alignment = size_of[dtype]() * width](0)
     comptime for k in range(width):
-        weights[k] = w_vec[k].cast[accum_t]()
+        weights[k] = w_lane[k].cast[accum_t]()
 
     var bias_v: Scalar[accum_t] = bias_ptr[Int(channel_id)].cast[accum_t]()
 
