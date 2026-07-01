@@ -11,8 +11,7 @@ import torch
 
 from causal_conv1d_mojo._dtype import _DTYPE_CODE
 from causal_conv1d_mojo.reference import causal_conv1d_update_ref
-from causal_conv1d_mojo.update import native_update, native_update_mps
-from causal_conv1d_mojo.update_cpu import native_update_cpu
+from causal_conv1d_mojo.update import native_update_mps
 
 # MPS launch overhead dominates for small decode shapes — below this
 # many elements (B*D*seqlen) the pure-PyTorch update_ref is faster than
@@ -192,39 +191,16 @@ def causal_conv1d_update(
     out = torch.empty_like(x)
     apply_silu = activation in ("silu", "swish")
 
-    if x.is_cuda:
-        native_update(
-            x,
-            weight,
-            bias,
-            conv_state,
-            conv_state_indices,
-            cache_seqlens,
-            out,
-            apply_silu,
-        )
-    elif x.device.type == "mps":
-        native_update_mps(
-            x,
-            weight,
-            bias,
-            conv_state,
-            conv_state_indices,
-            cache_seqlens,
-            out,
-            apply_silu,
-        )
-    else:
-        native_update_cpu(
-            x,
-            weight,
-            bias,
-            conv_state,
-            conv_state_indices,
-            cache_seqlens,
-            out,
-            apply_silu,
-        )
+    native_update_mps(
+        x,
+        weight,
+        bias,
+        conv_state,
+        conv_state_indices,
+        cache_seqlens,
+        out,
+        apply_silu,
+    )
 
     if unsqueeze:
         out = out.squeeze(-1)

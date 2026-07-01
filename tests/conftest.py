@@ -13,7 +13,6 @@ beartype_package("causal_conv1d_mojo")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-import causal_conv1d_mojo._fn as _fn_mod  # noqa: E402
 import causal_conv1d_mojo._update as _update_mod  # noqa: E402
 
 
@@ -21,7 +20,6 @@ import causal_conv1d_mojo._update as _update_mod  # noqa: E402
 # the Mojo kernels at every shape — otherwise the small-shape suite
 # would just be testing causal_conv1d_ref against itself. Setting the
 # threshold to 0 makes the `n_elts < threshold` gate never fire.
-_fn_mod._MPS_FWD_FALLBACK_THRESHOLD = 0
 _update_mod._MPS_UPDATE_FALLBACK_THRESHOLD = 0
 
 

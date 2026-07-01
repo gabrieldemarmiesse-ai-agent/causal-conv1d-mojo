@@ -36,25 +36,13 @@ if "MODULAR_NVPTX_COMPILER_PATH" not in os.environ:
 # doesn't pay the hook-registration cost.
 import mojo.importer  # noqa: F401, E402
 
-from causal_conv1d_mojo._fn import causal_conv1d_fn
 from causal_conv1d_mojo._update import causal_conv1d_update
-from causal_conv1d_mojo.causal_conv1d_varlen import (
-    causal_conv1d_varlen_states,
-    causal_conv1d_varlen_states_ref,
-)
-from causal_conv1d_mojo.reference import (
-    causal_conv1d_ref,
-    causal_conv1d_update_ref,
-)
+from causal_conv1d_mojo.reference import causal_conv1d_update_ref
 
 
 __version__ = "1.6.1"
 
 __all__ = [
-    "causal_conv1d_fn",
-    "causal_conv1d_ref",
     "causal_conv1d_update",
     "causal_conv1d_update_ref",
-    "causal_conv1d_varlen_states",
-    "causal_conv1d_varlen_states_ref",
 ]
