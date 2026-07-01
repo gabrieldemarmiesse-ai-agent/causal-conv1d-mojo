@@ -41,7 +41,6 @@ dev = [
     "setuptools>=70",
     "numpy>=2.0.0",
     "tomli-w",
-    "beartype>=0.22",
     "pytest-xdist>=3.8.0",
 ]
 

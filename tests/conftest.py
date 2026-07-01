@@ -1,13 +1,5 @@
-from beartype.claw import beartype_package  # noqa: I001
-
-beartype_package("causal_conv1d_mojo")
-
-import pytest  # noqa: E402
-import torch  # noqa: E402
-
-import causal_conv1d_mojo._update as _update_mod  # noqa: E402
-
-_update_mod._MPS_UPDATE_FALLBACK_THRESHOLD = 0
+import pytest
+import torch
 
 
 @pytest.fixture(autouse=True)
