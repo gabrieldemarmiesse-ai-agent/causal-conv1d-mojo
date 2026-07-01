@@ -20,8 +20,6 @@ def update_kernel(
     state_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     o_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
 ):
-    comptime accum_t = DType.float32
-
     var batch_id: Int32 = Int32(block_idx.x)
     var channel_id: Int32 = Int32(block_idx.y) * Int32(kNThreadsUpdate) + Int32(
         thread_idx.x
@@ -39,18 +37,12 @@ def update_kernel(
     # weight has shape (dim, 2), also contiguous — channel stride = 2.
     var w_lane = w_ptr + Int(channel_id * 2)
 
-    var w0: Scalar[accum_t] = w_lane[0].cast[accum_t]()
-    var w1: Scalar[accum_t] = w_lane[1].cast[accum_t]()
-
     # Phase 2: read the single history value (state_len is always
     # width-1=1 for this repro, so there's exactly one).
-    var x0: Scalar[accum_t] = state_lane[0].cast[accum_t]()
+    var x0 = state_lane[0]
 
     # Phase 3: consume the single new x, write into state, emit output.
-    var x_val = x_lane[0]
-    state_lane[0] = x_val
-    var x1: Scalar[accum_t] = x_val.cast[accum_t]()
+    var x1 = x_lane[0]
+    state_lane[0] = x1
 
-    var out_val: Scalar[accum_t] = w0 * x0 + w1 * x1
-
-    out_lane[0] = out_val.cast[dtype]()
+    out_lane[0] = w_lane[0] * x0 + w_lane[1] * x1
