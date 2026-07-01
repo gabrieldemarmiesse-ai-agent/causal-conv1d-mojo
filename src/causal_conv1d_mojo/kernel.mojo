@@ -68,18 +68,6 @@ def update_kernel(
     var advance_len: Int32 = seqlen
     var x_vals = SIMD[accum_t, width](0)
 
-    # Phase 1: shift state left by `seqlen`.
-    var n_shift: Int32 = sl - advance_len - Int32(width - 1)
-    if n_shift > 0:
-        var sj: Int32 = 0
-        while True:
-            state_lane[Int(sj * state_l_stride)] = state_lane[
-                Int((sj + advance_len) * state_l_stride)
-            ]
-            sj = sj + Int32(1)
-            if not (sj < n_shift):
-                break
-
     # Phase 2: read trailing W-1 history into x_vals (with writeback for
     # the small-state_len edge case).
     var state_vals = SIMD[dtype, width - 1](0)
