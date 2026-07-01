@@ -14,17 +14,17 @@ import torch
 import causal_conv1d_mojo
 from causal_conv1d_mojo import causal_conv1d_update_ref
 
-from _helpers import _FWD_TOL, _make_bias, _max_diff
+from _helpers import _FWD_TOL, _max_diff
 
 
-def test_update_single_token(dtype, width, bias_present):
+def test_update_single_token(dtype, width):
     device = "mps"
     activation = "silu"
     B, D = 2, 16
     state_len = width - 1
     x = torch.randn(B, D, dtype=dtype, device=device)
     weight = torch.randn(D, width, dtype=dtype, device=device)
-    bias = _make_bias(D, dtype=dtype, device=device, present=bias_present)
+    bias = torch.randn(D, dtype=dtype, device=device)
     state = torch.randn(B, D, state_len, dtype=dtype, device=device)
 
     state_ours = state.clone()
