@@ -74,12 +74,3 @@ def gpu_address(t: torch.Tensor) -> int:
     base_gpu = libobjc.objc_msgSend(buf_obj, _sel_gpu_address())
     offset_bytes = t.data_ptr() - buf_obj
     return base_gpu + offset_bytes
-
-
-def gpu_address_or_zero(t: torch.Tensor | None) -> int:
-    """Same as `gpu_address` but returns 0 for `None` — matches the
-    `_ptr()` helper in `_dtype.py` used by the kernel argument-builders.
-    """
-    if t is None:
-        return 0
-    return gpu_address(t)
