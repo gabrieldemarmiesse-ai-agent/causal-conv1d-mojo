@@ -4,7 +4,6 @@ dtype=float16, width=4 hardcoded in kernel.mojo, no -D defines needed).
 
 from std.gpu.host import DeviceContext
 from std.gpu.host.device_context import _DeviceContextPtr, _DeviceContextCpp
-from std.math import ceildiv
 from std.os import abort
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
@@ -46,7 +45,7 @@ def causal_conv1d_update_variant(
     )
     var ctx = DeviceContext(_DeviceContextPtr[mut=True](raw_ctx_ptr))
 
-    var grid = (batch_int, ceildiv(dim_int, kNThreadsUpdate))
+    var grid = (batch_int,)
 
     var x_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
         unsafe_from_address=x_addr

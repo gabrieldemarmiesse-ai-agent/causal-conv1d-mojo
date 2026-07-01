@@ -6,7 +6,7 @@ from std.gpu.globals import MAX_THREADS_PER_BLOCK_METADATA
 from std.utils.index import StaticTuple
 
 
-comptime kNThreadsUpdate: Int = 64
+comptime kNThreadsUpdate: Int = 16
 comptime dtype = DType.float16
 
 
@@ -20,12 +20,11 @@ def update_kernel(
     state_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     o_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
 ):
+    # kNThreadsUpdate == dim (16, the repro's fixed D) exactly, so a
+    # single block dimension covers the whole channel range — no
+    # block_idx.y and no bounds check needed.
     var batch_id: Int32 = Int32(block_idx.x)
-    var channel_id: Int32 = Int32(block_idx.y) * Int32(kNThreadsUpdate) + Int32(
-        thread_idx.x
-    )
-    if channel_id >= dim:
-        return
+    var channel_id: Int32 = Int32(thread_idx.x)
 
     # x/state/out all have shape (batch, dim, 1) and are always freshly
     # allocated + contiguous in this repro, so batch stride = dim and
