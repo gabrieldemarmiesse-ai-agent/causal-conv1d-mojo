@@ -4,7 +4,7 @@ Mojo/Metal cold-cache bug — see repro.py."""
 
 from __future__ import annotations
 
-from causal_conv1d_mojo._update import causal_conv1d_update
+from causal_conv1d_mojo.update import causal_conv1d_update
 
 __all__ = [
     "causal_conv1d_update",

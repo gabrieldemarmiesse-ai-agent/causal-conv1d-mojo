@@ -50,15 +50,19 @@ def _get_variant_fn():
     return fn, ctx_handle
 
 
-def native_update_mps(
+def causal_conv1d_update(
     x: torch.Tensor,
+    conv_state: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
-    conv_state: torch.Tensor,
-    out: torch.Tensor,
-) -> None:
+) -> torch.Tensor:
     """torch MPS data_ptr is an Obj-C MTLBuffer pointer; extract Metal
     `gpuAddress` instead (see _mps.py)."""
+    unsqueeze = x.dim() == 2
+    if unsqueeze:
+        x = x.unsqueeze(-1)
+    out = torch.empty_like(x)
+
     torch.mps.synchronize()
     variant_fn, ctx_handle = _get_variant_fn()
     variant_fn(
@@ -83,3 +87,7 @@ def native_update_mps(
         out.stride(2),
         ctx_handle,
     )
+
+    if unsqueeze:
+        out = out.squeeze(-1)
+    return out
