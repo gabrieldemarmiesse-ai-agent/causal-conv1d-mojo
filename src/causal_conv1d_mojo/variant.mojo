@@ -6,7 +6,7 @@ from std.os import abort
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 
-from kernel import dtype, kBatch, kNThreadsUpdate, update_kernel
+from kernel import dtype, kNThreadsUpdate, update_kernel
 
 
 def causal_conv1d_update_variant(
@@ -17,8 +17,6 @@ def causal_conv1d_update_variant(
     var o_addr = Int(py=args[1])
 
     var ctx = DeviceContext()
-
-    var grid = (kBatch,)
 
     var x_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
         unsafe_from_address=x_addr
@@ -32,7 +30,7 @@ def causal_conv1d_update_variant(
         compiled,
         x_ptr,
         o_ptr,
-        grid_dim=grid,
+        grid_dim=(1,),
         block_dim=(kNThreadsUpdate,),
     )
     ctx.synchronize()
