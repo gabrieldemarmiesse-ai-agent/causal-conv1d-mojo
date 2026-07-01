@@ -44,9 +44,6 @@ def causal_conv1d_update_variant(
     # ctx_handle is appended as args[13] by call_update.
     var ctx_handle_addr = Int(py=args[13])
 
-    if batch_int == 0 or dim_int == 0:
-        return PythonObject(None)
-
     launch_update(
         batch_int,
         dim_int,
