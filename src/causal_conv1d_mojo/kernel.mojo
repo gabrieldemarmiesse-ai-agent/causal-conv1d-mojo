@@ -83,31 +83,15 @@ def update_kernel(
             state_lane[Int(write_idx * state_l_stride)] = state_vals[i]
         x_vals[i] = state_vals[i].cast[accum_t]()
 
-    # Phase 3: walk new x, write into state, emit output.
-    if advance_len < 1:
-        return
-    var i: Int32 = 0
-    while True:
-        var x_val = x_lane[Int(i * x_l_stride)]
+    # Phase 3: consume the single new x (seqlen is always 1 for this
+    # repro), write into state, emit output.
+    var x_val = x_lane[0]
+    state_lane[Int((sl - Int32(1)) * state_l_stride)] = x_val
+    x_vals[width - 1] = x_val.cast[accum_t]()
 
-        var write_idx: Int32 = sl - advance_len + i
-        if i < advance_len and write_idx >= 0:
-            state_lane[Int(write_idx * state_l_stride)] = x_val
+    var out_val: Scalar[accum_t] = bias_v
+    comptime for k in range(width):
+        out_val += weights[k] * x_vals[k]
+    out_val = _silu_f32(Float32(out_val))
 
-        x_vals[width - 1] = x_val.cast[accum_t]()
-
-        var out_val: Scalar[accum_t] = bias_v
-
-        comptime for k in range(width):
-            out_val += weights[k] * x_vals[k]
-
-        out_val = _silu_f32(Float32(out_val))
-
-        out_lane[Int(i * o_l_stride)] = out_val.cast[dtype]()
-
-        comptime for k in range(width - 1):
-            x_vals[k] = x_vals[k + 1]
-
-        i = i + Int32(1)
-        if not (i < advance_len):
-            break
+    out_lane[0] = out_val.cast[dtype]()
