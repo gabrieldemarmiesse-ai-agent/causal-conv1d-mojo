@@ -1042,16 +1042,55 @@ def assembly(be: Backend, fn, dtype, canon, refresh_reference) -> None:
     elif be.name == "rocm":
         _assembly_dump_only(be, fn, dtype, canon)
     elif be.name == "metal":
-        # compile_function's dump_asm (our DUMP_ASSEMBLY_INTO) emits textual
-        # ISA only for PTX / AMDGPU targets; Metal lowers straight to a
-        # metallib with no textual ISA dump, so there is nothing to write
-        # (and occupancy is GUI-only).
-        skip(
-            "(e/f/g) GPU asm",
-            "Mojo emits no textual Metal ISA (metallib only); occupancy is GUI-only",
-        )
+        _assembly_metal(fn)
     else:  # cpu
         skip("(e/f/g) GPU asm", "CPU build emits no GPU device code")
+
+
+def _assembly_metal(fn) -> None:
+    """Metal has no textual native ISA (Mojo emits a metallib, and Apple
+    ships no g16 instruction printer), but we can still introspect the
+    kernel headlessly via scripts/_metal_introspect.py: static pipeline
+    facts + an AIR instruction-mix histogram (the Apple analog of the
+    NVIDIA PTX histogram) + native AGX code size. The just-run bench left
+    the kernel's metallib in ~/.cache/modular for the tool to find."""
+    section("(e/f/g) Metal kernel introspection (static facts + AIR mix)")
+    r = run(
+        [sys.executable, str(REPO / "scripts" / "_metal_introspect.py"),
+         "--fn", fn, "--json"],
+        capture=True,
+    )
+    line = (r.stdout or "").strip().splitlines()
+    if r.returncode != 0 or not line:
+        if r.stderr:
+            sys.stderr.write(r.stderr)
+        warn("metal introspection unavailable")
+        return
+    try:
+        rep = json.loads(line[-1])
+    except json.JSONDecodeError:
+        warn("metal introspection produced no JSON")
+        return
+    s = rep.get("static", {})
+    if "function" in s:
+        print(
+            f"  threadgroup mem: {s['threadgroup_memory_bytes']} B | "
+            f"SIMD width: {s['simd_width']} | "
+            f"max threads/tg: {s['max_threads_per_threadgroup']}"
+        )
+    agx = rep.get("agx", {})
+    if agx.get("slice"):
+        print(f"  native code: {agx['code_bytes']} B ({agx['slice']})")
+    hist = rep.get("air_histogram", {})
+    if hist and "error" not in hist:
+        top = sorted(hist.items(), key=lambda kv: -kv[1])[:10]
+        print("  AIR instruction mix (top 10, pre-regalloc — analog of PTX):")
+        for op, c in top:
+            print(f"    {c:5d}  {op}")
+    print(
+        "  (HW occupancy / ALU% / stalls are GUI-only on Apple; not shown — "
+        "see _metal_introspect.py header)"
+    )
 
 
 def _dump_ptx(be: Backend, fn, dtype, canon, asm_dir: Path) -> Path | None:
