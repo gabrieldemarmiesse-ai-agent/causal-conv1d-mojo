@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import os
+import time
 from functools import lru_cache
 
 import torch
@@ -83,3 +85,73 @@ def gpu_address_or_zero(t: torch.Tensor | None) -> int:
     if t is None:
         return 0
     return gpu_address(t)
+
+
+# Revival cadence. macOS evicts idle GPU memory after ~1-1.5 s
+# (measured on M4; matches ggml-org/llama.cpp#10119), so touching each
+# heap at least every _REVIVE_WINDOW_S keeps it comfortably resident
+# while making steady-state loops pay (almost) nothing.
+# CAUSAL_CONV1D_MPS_REVIVE=always  -> revive on every call (paranoid)
+# CAUSAL_CONV1D_MPS_REVIVE=off     -> never revive (debugging only)
+_REVIVE_MODE = os.environ.get("CAUSAL_CONV1D_MPS_REVIVE", "auto")
+_REVIVE_WINDOW_S = 0.35
+# Per-tensor last-revival stamps, keyed on `t.data_ptr()` (buffer
+# object pointer + storage offset — the fast C-level accessor;
+# `untyped_storage()` costs ~15 us per call in Python, data_ptr ~1 us).
+# Keying per pointer (not one global stamp) matters: a call inside the
+# window may still introduce a tensor whose heap has been idle for
+# minutes (say, a second model's weights) — that tensor must force a
+# revival even though the previous call's tensors are all still hot.
+# Distinct views of one storage get distinct keys (harmless: each is
+# revived once, then hot). Pointer reuse by torch's allocator is also
+# harmless: a recycled MTLBuffer belongs to the same heap that was just
+# touched through its previous owner.
+_revive_stamp: dict[int, float] = {}
+
+
+def revive_heaps(*tensors: torch.Tensor | None) -> None:
+    """Touch each tensor with a tiny GPU op so its MTLHeap is resident
+    when the Mojo kernel dispatches. Call this (followed by
+    `torch.mps.synchronize()`) immediately before every Mojo launch.
+
+    Why: torch MPS tensors are sub-allocations of hazard-tracked
+    `MTLHeap`s, and macOS evicts idle GPU memory after ~1-1.5 s. Mojo's
+    Metal backend only declares resources it allocated itself to its
+    compute encoder (`useResource:` is skipped for foreign addresses),
+    so a Mojo kernel referencing an evicted heap silently reads zeros
+    and drops writes — no error anywhere. Any submitted torch op that
+    references the buffer makes the driver re-map its heap, putting the
+    immediately-following Mojo dispatch back inside the residency
+    window. Heaps are revived individually (torch pools small and large
+    allocations on different heaps), hence one touch per tensor. See
+    BUG_REPORT.md on the `mojo-cold-cache-bug-repro` branch for the
+    full investigation.
+
+    Cost control: the touches are batched into one `torch.stack` per
+    dtype group (a single kernel reading one element of every tensor in
+    the group — layout-agnostic 0-d views, no version-counter bumps),
+    and skipped entirely when every argument's storage was revived
+    < _REVIVE_WINDOW_S ago — far inside the driver's ~1-1.5 s eviction
+    horizon, so a steady decode/bench loop revives at most ~3x per
+    second instead of per call.
+    """
+    if _REVIVE_MODE == "off":
+        return
+    live = [t for t in tensors if t is not None and t.numel() > 0]
+    now = time.monotonic()
+    if _REVIVE_MODE != "always":
+        stamps = _revive_stamp
+        if all(
+            now - stamps.get(t.data_ptr(), 0.0) < _REVIVE_WINDOW_S
+            for t in live
+        ):
+            return
+    groups: dict[torch.dtype, list[torch.Tensor]] = {}
+    for t in live:
+        groups.setdefault(t.dtype, []).append(t[(0,) * t.dim()])
+    for group in groups.values():
+        torch.stack(group)
+    if len(_revive_stamp) > 65536:
+        _revive_stamp.clear()
+    for t in live:
+        _revive_stamp[t.data_ptr()] = now

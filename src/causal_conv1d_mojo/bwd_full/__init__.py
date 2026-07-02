@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from causal_conv1d_mojo._dtype import _DTYPE_CODE, _ptr
-from causal_conv1d_mojo._mps import gpu_address, gpu_address_or_zero
+from causal_conv1d_mojo._mps import gpu_address, gpu_address_or_zero, revive_heaps
 
 
 def native_bwd_full(
@@ -92,7 +92,23 @@ def native_bwd_full_mps(
     """
     from causal_conv1d_mojo.bwd_full._jit import call_bwd_full
 
-    torch.mps.synchronize()
+    def _pre_dispatch() -> None:
+        # Post-compile, pre-launch: revive every argument tensor's
+        # MTLHeap (see _mps.revive_heaps), then flush torch's queue.
+        revive_heaps(
+            x,
+            weight,
+            bias,
+            dout,
+            seq_idx,
+            initial_states,
+            dx,
+            dweight_acc,
+            dbias_acc,
+            dinitial_states,
+        )
+        torch.mps.synchronize()
+
     call_bwd_full(
         (
             gpu_address(x),
@@ -135,5 +151,6 @@ def native_bwd_full_mps(
             dinitial_states.stride(1) if dinitial_states is not None else 0,
             dinitial_states.stride(2) if dinitial_states is not None else 0,
             0,  # use_external_stream: Metal path enqueues on ctx
-        )
+        ),
+        pre_dispatch=_pre_dispatch,
     )

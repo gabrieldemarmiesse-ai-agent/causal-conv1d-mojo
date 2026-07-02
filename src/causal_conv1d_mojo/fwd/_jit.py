@@ -38,13 +38,20 @@ _KN_ELTS = {0: 8, 1: 8, 2: 4}
 _KNTHREADS = 128
 
 
-def call_fwd(args: tuple) -> None:
+def call_fwd(args: tuple, pre_dispatch: Callable[[], None] | None = None) -> None:
     """JIT-compile (if needed) and dispatch a single fwd call.
 
     ``args`` is the 29-tuple of runtime values built by
-    ``fwd/__init__.py::native_fwd``.
+    ``fwd/__init__.py::native_fwd``. ``pre_dispatch`` runs after the
+    (possibly seconds-long) JIT compile and immediately before the
+    kernel launch — the MPS path uses it to revive the argument
+    tensors' MTLHeaps inside the driver's ~1 s residency window (see
+    ``_mps.revive_heaps``); doing it any earlier would let a slow
+    compile re-idle the heaps.
     """
     variant_fn, ctx_handle = _get_variant_fn(_config_from_args(args))
+    if pre_dispatch is not None:
+        pre_dispatch()
     # Tack ctx_handle on as the 30th positional arg — the variant
     # entry point destructures `args[29]` for it. Avoids the per-call
     # hipStreamCreate/Destroy churn from `var ctx = DeviceContext()`.

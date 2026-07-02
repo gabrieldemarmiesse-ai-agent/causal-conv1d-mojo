@@ -31,10 +31,18 @@ _DTYPE_NAME = {0: "fp16", 1: "bf16", 2: "fp32"}
 _DTYPE_DEFINE = {0: "float16", 1: "bfloat16", 2: "float32"}
 
 
-def call_update(args: tuple) -> None:
-    """JIT-compile (if needed) and dispatch a single update call."""
+def call_update(args: tuple, pre_dispatch: Callable[[], None] | None = None) -> None:
+    """JIT-compile (if needed) and dispatch a single update call.
+
+    ``pre_dispatch`` runs after the (possibly seconds-long) JIT compile
+    and immediately before the launch — the MPS path uses it to revive
+    the argument tensors' MTLHeaps inside the driver's ~1 s residency
+    window (see ``_mps.revive_heaps``).
+    """
     config = _config_from_args(args)
     variant_fn, ctx_handle = _get_variant_fn(config)
+    if pre_dispatch is not None:
+        pre_dispatch()
     # Tack ctx_handle on as the 31st positional arg — the variant
     # entry point destructures `args[30]` for it.
     variant_fn(*args, ctx_handle)
