@@ -875,6 +875,12 @@ def _record_trace(child_argv: list[str], trace: str, *, attempts: int = 6) -> No
 # least-throttled group as the headline when full Maximum clock never landed.
 _CLOCK_RANK = {"Minimum": 0, "Low": 1, "Medium": 2, "High": 3, "Maximum": 4}
 
+# GPU duty-cycle threshold below which a metal run is flagged
+# launch/sync-bound. Single source of truth: master_bench.py's table
+# consumes the note computed from this in `_summarize_trace` rather than
+# re-implementing the threshold.
+_DUTY_LAUNCH_BOUND_PCT = 40.0
+
 
 def _pick_headline(groups: list[dict]) -> dict | None:
     """The conv kernel's group: the `Compute Command` encoder, at the highest
@@ -909,32 +915,37 @@ def _summarize_trace(
     GPU encoder grouped by (channel, label, clock) and headline_durs_us is
     the per-interval µs list for the conv kernel (for min/spread reporting).
 
-    ``expected_iters`` guards the headline against foreign-encoder
-    contamination: Mojo doesn't label its Metal encoders, so torch's own
-    compute dispatches inside the traced region (autograd bookkeeping for
-    the bwd callable, dtype casts, the _mps heap-revival touches, ...)
-    land in the *same* unlabeled Compute group as our kernel. Those
-    encoders are tiny next to the conv kernel, so when the headline group
-    holds more intervals than the loop ran iterations we keep only the
-    ``expected_iters`` largest durations — otherwise a single 3 µs torch
-    encoder becomes the reported "kernel min". The number of discarded
-    intervals is surfaced as ``headline_excluded``.
+    ``expected_iters`` guards the headline against contamination: Mojo
+    doesn't label its Metal encoders, so torch's own compute dispatches
+    inside the traced region (autograd bookkeeping for the bwd callable,
+    dtype casts, ...) land in the *same* unlabeled Compute group as our
+    kernel — and so do the child's *warmup* dispatches, which are
+    kernel-sized and can't be told apart by duration. Two-stage filter:
+    (1) drop intervals smaller than a quarter of the group's largest
+    (foreign torch encoders are tiny next to the conv kernel), then
+    (2) keep the chronologically LAST ``expected_iters`` of what remains
+    (warmup dispatches run first, so this excludes them without biasing
+    the kept sample toward slow iterations the way a keep-largest rule
+    would). The number of discarded intervals is surfaced as
+    ``headline_excluded``; ``headline_short`` flags a recording whose
+    final count came up short of ``expected_iters``.
     """
     windows = _load_clock_timeline(trace)
-    bucket: dict[tuple[str, str, str], list[int]] = defaultdict(list)
+    bucket: dict[tuple[str, str, str], list[tuple[int, int]]] = defaultdict(list)
     n = 0
     grand_ns = 0
     for channel, label, start_ns, ns in _parse_intervals(
         _xctrace_export(trace, _XCTRACE_SCHEMA), process
     ):
         clock = _clock_at(windows, start_ns) or "?"
-        bucket[(channel, label, clock)].append(ns)
+        bucket[(channel, label, clock)].append((start_ns, ns))
         n += 1
         grand_ns += ns
 
     groups: list[dict] = []
-    headline_by_key: dict[tuple, list[int]] = {}
-    for (channel, label, clock), durs in bucket.items():
+    headline_by_key: dict[tuple, list[tuple[int, int]]] = {}
+    for (channel, label, clock), pairs in bucket.items():
+        durs = [ns for _, ns in pairs]
         groups.append(
             {
                 "channel": channel,
@@ -949,30 +960,50 @@ def _summarize_trace(
                 "total_us": sum(durs) / 1e3,
             }
         )
-        headline_by_key[(channel, label, clock)] = durs
+        headline_by_key[(channel, label, clock)] = pairs
     groups.sort(key=lambda g: -g["total_us"])
 
     headline = _pick_headline(groups)
     headline_durs = []
     headline_excluded = 0
+    headline_short = False
     if headline is not None:
         key = (headline["channel"], headline["label"], headline["clock"])
-        durs = sorted(headline_by_key[key], reverse=True)
-        if expected_iters is not None and 0 < expected_iters < len(durs):
-            headline_excluded = len(durs) - expected_iters
-            durs = durs[:expected_iters]
-            # Re-derive the headline's stats from the filtered set so the
-            # printed number and Measurement agree (the raw, contaminated
-            # group row stays visible in the groups table above).
-            headline = {
-                **headline,
-                "count": len(durs),
-                "median_us": statistics.median(durs) / 1e3,
-                "min_us": min(durs) / 1e3,
-                "max_us": max(durs) / 1e3,
-                "total_us": sum(durs) / 1e3,
-            }
+        pairs = headline_by_key[key]
+        durs = [ns for _, ns in pairs]
+        if expected_iters is not None and expected_iters > 0:
+            # (1) size: drop tiny foreign encoders.
+            biggest = max(durs)
+            sized = [(s, ns) for s, ns in pairs if ns * 4 >= biggest]
+            # (2) time: warmup dispatches run before the timed loop.
+            sized.sort(key=lambda p: p[0])
+            kept = sized[-expected_iters:]
+            headline_excluded = len(pairs) - len(kept)
+            headline_short = len(kept) < expected_iters
+            durs = [ns for _, ns in kept]
+            if headline_excluded:
+                # Re-derive the headline's stats from the filtered set so
+                # the printed number and Measurement agree (the raw,
+                # contaminated group row stays visible in the table).
+                headline = {
+                    **headline,
+                    "count": len(durs),
+                    "median_us": statistics.median(durs) / 1e3,
+                    "min_us": min(durs) / 1e3,
+                    "max_us": max(durs) / 1e3,
+                    "total_us": sum(durs) / 1e3,
+                }
         headline_durs = [d / 1e3 for d in durs]
+
+    duty = _gpu_duty_cycle(trace)
+    # One-line health note, computed here (single source of truth) so
+    # master_bench.py's table can print it without re-implementing the
+    # thresholds. Empty string = healthy.
+    note = ""
+    if headline is not None and windows and headline["clock"] != "Maximum":
+        note = "DVFS-throttled (not steady state)"
+    elif duty and duty["busy_pct"] < _DUTY_LAUNCH_BOUND_PCT:
+        note = "launch/sync-bound (low GPU residency)"
 
     analysis = {
         "trace": trace,
@@ -981,20 +1012,48 @@ def _summarize_trace(
         "groups": groups,
         "headline": headline,
         "headline_excluded": headline_excluded,
+        "headline_short": headline_short,
         "intervals": n,
         "total_gpu_ms": grand_ns / 1e6,
-        "duty": _gpu_duty_cycle(trace),
+        "duty": duty,
+        "note": note,
     }
     return analysis, headline_durs
+
+
+def _canary_check(result) -> str:
+    """Cheap output-validity check on a kernel result: 'ok', or why not.
+
+    Targets the known Mojo/Metal silent-failure class (a dispatch against
+    an idle-evicted heap reads zeros / drops writes, see _mps.revive_heaps
+    in the package): with random inputs, an all-zero output tensor is
+    (essentially) impossible legitimately, so it's a reliable canary. Also
+    rejects NaN/Inf. `result` is whatever the impl callable returned — a
+    tensor or a tuple of tensors (the bwd callable returns grads).
+    """
+    tensors = result if isinstance(result, (tuple, list)) else (result,)
+    for t in tensors:
+        if t is None or not torch.is_tensor(t):
+            continue
+        f = t.float()
+        if not torch.isfinite(f).all().item():
+            return "non-finite values in output"
+        if f.abs().max().item() == 0.0:
+            return "all-zero output (silently lost dispatch?)"
+    return "ok"
 
 
 def run_metal_kernel(cfg: Config, args, env_sig: dict, tag: str) -> dict:
     """Orchestrate the Apple kernel-time measurement and assemble the report.
 
-    Pre-warms the JIT cache (un-traced subprocess), records a Metal System
-    Trace around the workload, parses the per-encoder GPU intervals, and
-    returns a report carrying both the headline kernel time (mojo) and the
-    full Instruments analysis (`metal_analysis`).
+    Pre-warms the JIT cache (un-traced subprocess), runs a one-call output
+    canary in-process, then records `--runs` independent Metal System
+    Traces around the workload. Each recording contributes one number (the
+    filtered-headline median of its per-encoder GPU intervals) to the
+    Measurement, so `min (us)` / `spread` mean the same thing they mean on
+    the CUDA path: best-of-N independent repetitions and their scatter.
+    The full Instruments analysis of the best recording is attached as
+    `metal_analysis`.
     """
     if shutil.which("xctrace") is None:
         raise SystemExit(
@@ -1015,20 +1074,76 @@ def run_metal_kernel(cfg: Config, args, env_sig: dict, tag: str) -> dict:
             f"{warm.stdout}\n{warm.stderr}"
         )
 
-    # 2) Record the Metal System Trace around a re-launch of the workload.
-    trace_dir = tempfile.mkdtemp(prefix="ccv_metal_")
-    trace = os.path.join(trace_dir, f"ccv_{cfg.fn}.trace")
-    child = _workload_argv(cfg, args, iters=args.iters, warmup=1)
-    print(f"\n=== xctrace record (Metal System Trace) -> {trace} ===")
-    _record_trace(child, trace)
+    # 2) Output canary, in-process with the normal production path (heap
+    #    revival on): xctrace only measures time — a silently-corrupted
+    #    dispatch has a perfectly normal duration, so validity must be
+    #    checked on the values, once, here.
+    canary = _canary_check(make_callable("mojo", cfg)())
 
-    # 3) Read per-encoder GPU intervals back out.
-    analysis, headline_durs = _summarize_trace(trace, expected_iters=args.iters)
-    m = Measurement(runs_us=headline_durs)
-    if not headline_durs:
-        m.error = "no Compute GPU intervals found in trace"
+    # 3) Record `--runs` independent traces; each yields one headline number.
+    trace_dir = tempfile.mkdtemp(prefix="ccv_metal_")
+    child = _workload_argv(cfg, args, iters=args.iters, warmup=5)
+    n_recs = max(1, args.runs)
+    run_medians: list[float] = []
+    best: tuple[float, dict] | None = None  # (median, analysis)
+    last_analysis: dict = {}
+    other_notes: list[str] = []
+    for rec in range(n_recs):
+        trace = os.path.join(trace_dir, f"ccv_{cfg.fn}_r{rec}.trace")
+        print(
+            f"\n=== xctrace record {rec + 1}/{n_recs} "
+            f"(Metal System Trace) -> {trace} ==="
+        )
+        _record_trace(child, trace)
+        analysis, headline_durs = _summarize_trace(
+            trace, expected_iters=args.iters
+        )
+        last_analysis = analysis
+        if analysis.get("note"):
+            other_notes.append(analysis["note"])
+        if analysis.get("headline_short"):
+            other_notes.append("fewer kernel intervals than iters in a trace")
+        if not headline_durs:
+            continue
+        med = statistics.median(headline_durs)
+        run_medians.append(med)
+        if best is None or med < best[0]:
+            best = (med, analysis)
+
+    analysis = dict(best[1]) if best is not None else last_analysis
+    # A healthy best recording must not mask trouble in its siblings —
+    # surface any note raised by ANY recording (throttling, undercounts).
+    cross = sorted(set(other_notes) - {analysis.get("note", "")})
+    if cross:
+        merged = "; ".join(
+            filter(None, [analysis.get("note", ""), *cross])
+        )
+        analysis["note"] = f"{merged} (some recordings)"
+    if 0 < len(run_medians) < n_recs:
+        analysis["note"] = (
+            (analysis.get("note", "") + "; " if analysis.get("note") else "")
+            + f"only {len(run_medians)}/{n_recs} recordings parsed"
+        )
+
+    # Keep the best recording's .trace for Instruments; the rest are
+    # tens-to-hundreds of MB each and already reduced to numbers.
+    keep = analysis.get("trace")
+    for entry in os.listdir(trace_dir):
+        full = os.path.join(trace_dir, entry)
+        if full != keep:
+            shutil.rmtree(full, ignore_errors=True)
+
+    errors = []
+    if not run_medians:
+        errors.append("no Compute GPU intervals found in any trace")
+    if canary != "ok":
+        errors.append(f"canary: {canary}")
+    m = Measurement(runs_us=run_medians)
+    if errors:
+        m.error = "; ".join(errors)
 
     rep = _assemble_report(cfg, args, env_sig, tag, {"mojo": m})
+    rep["canary"] = canary
     rep["metal_analysis"] = analysis
     return rep
 
@@ -1299,7 +1414,7 @@ def _print_metal_analysis(a: dict) -> None:
             f"    GPU duty cycle (device-global): {d['busy_pct']:.1f}% active  "
             f"({d['active_ms']:.2f} ms active / {d['idle_ms']:.2f} ms idle)"
         )
-        if d["busy_pct"] < 40.0:
+        if d["busy_pct"] < _DUTY_LAUNCH_BOUND_PCT:
             print(
                 "          -> low residency: launch/sync-bound, not compute-bound "
                 "(the per-call sync starves the GPU and holds the clock down)."

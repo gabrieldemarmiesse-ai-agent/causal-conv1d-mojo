@@ -156,7 +156,18 @@ exist**:
   a 3% stop-criterion (a true perf *gate*); rocm/cpu: vs the pure-PyTorch
   fallback (reported, not gated — no hand-tuned baseline exists); metal:
   *absolute* per-kernel GPU time read back from a `xctrace` Metal System
-  Trace (mojo-only — upstream is CUDA-only).
+  Trace (mojo-only — upstream is CUDA-only), **gated two ways**: a
+  one-call output canary (all-zero/non-finite result fails — timing
+  can't see a silently-lost dispatch) and a ratcheting regression gate
+  vs this machine's own best per-shape median, persisted in
+  `scripts/baselines/metal_kernel_gpu_time.json` (gitignored;
+  >10% over baseline fails; faster runs lower the baseline;
+  `--refresh-baseline` reseeds after an intentional change). On metal
+  `--runs N` to `_bench.py` means N whole xctrace recordings (each
+  contributing its foreign-encoder-filtered headline median as one run);
+  the master bench records 1 in quick tier / 3 in `--full`. The
+  metal *walltime* step (h) is tagged `unlocked` — the clock lock is an
+  xctrace template, so it never applies outside recordings.
 - **(d) deep profiler** — cuda: `ncu` (ephemeral via `pixi exec`); metal:
   the per-encoder GPU time + clock split + duty cycle already parsed from
   the step-(c) trace; cpu: `perf stat`; rocm: skipped (`rocprofv3` can't
