@@ -1145,6 +1145,21 @@ def run_metal_kernel(cfg: Config, args, env_sig: dict, tag: str) -> dict:
     rep = _assemble_report(cfg, args, env_sig, tag, {"mojo": m})
     rep["canary"] = canary
     rep["metal_analysis"] = analysis
+    # The roofline % divides bytes by the measured kernel time, so it's
+    # only trustworthy at Maximum GPU clock — a throttled run inflates the
+    # time and makes a memory-bound kernel look dispatch-bound. If the
+    # headline clock isn't Maximum, mark the verdict unreliable rather than
+    # let an agent act on a downclock artifact.
+    rl = rep.get("roofline")
+    hl = (analysis or {}).get("headline") or {}
+    if rl and hl.get("clock") != "Maximum":
+        rl["clock_unreliable"] = True
+        rl["regime"] = "throttled (clock != Maximum)"
+        rl["hint"] = (
+            f"measured at {hl.get('clock', '?')} clock, not Maximum — the "
+            "roofline % is a downclock artifact; re-run under master_bench's "
+            "lock phase before trusting the regime"
+        )
     return rep
 
 
@@ -1286,6 +1301,94 @@ def _measure_impl(impl: str, cfg: Config, args) -> Measurement:
     return m
 
 
+# Peak DRAM bandwidth (GB/s) by device-name substring — used for the
+# roofline verdict. Memory-bound kernels can't beat this; % of it tells an
+# agent whether a shape has any bandwidth headroom left. Extend as needed;
+# CAUSAL_CONV1D_PEAK_GBPS overrides, and an unknown device omits %-of-peak
+# (reporting achieved GB/s only) rather than inventing a denominator.
+_PEAK_GBPS = {
+    "Apple M4 Max": 546.0,
+    "Apple M4 Pro": 273.0,
+    "Apple M4": 120.0,
+    "Apple M3 Max": 400.0,
+    "Apple M3 Pro": 150.0,
+    "Apple M3": 100.0,
+    "Apple M2": 100.0,
+    "Apple M1": 68.0,
+    "H100": 3350.0,
+    "A100": 2039.0,
+}
+_DTYPE_BYTES = {"fp16": 2, "bf16": 2, "fp32": 4}
+
+
+def _peak_gbps(gpu: str) -> float | None:
+    override = os.environ.get("CAUSAL_CONV1D_PEAK_GBPS")
+    if override:
+        return float(override)
+    # Longest matching key wins ("Apple M4 Pro" before "Apple M4").
+    for name in sorted(_PEAK_GBPS, key=len, reverse=True):
+        if name in gpu:
+            return _PEAK_GBPS[name]
+    return None
+
+
+def _bytes_moved(cfg: Config) -> int:
+    """Ideal global-memory traffic (bytes) for one call — the roofline
+    numerator. Each kernel touches every input/output element once
+    (that's the design goal), so this is the theoretical floor; real
+    traffic can only be >= this (halo re-reads, cache misses)."""
+    b = _DTYPE_BYTES.get(cfg.dtype, 2)
+    w = cfg.width
+    if cfg.fn in ("fwd", "bwd"):
+        B, D, L = cfg.shape[0], cfg.shape[1], cfg.shape[2]
+        elems = (
+            3 * B * D * L if cfg.fn == "bwd"  # read x + dout, write dx
+            else 2 * B * D * L                # read x, write out
+        )
+        elems += D * w + (D if cfg.has_bias else 0)  # weight + bias (small)
+        return elems * b
+    # update (decode): read x + state + weight, write out + state
+    B, D = cfg.shape[0], cfg.shape[1]
+    sl = cfg.state_len
+    return (2 * B * D + 2 * B * D * sl + D * w) * b
+
+
+def _roofline(cfg: Config, kernel_us: float, gpu: str) -> dict:
+    """Turn a measured kernel time into a memory-roofline verdict: achieved
+    GB/s, % of the device's peak, the theoretical floor time, and a
+    regime + one-line hint an agent can act on."""
+    nbytes = _bytes_moved(cfg)
+    peak = _peak_gbps(gpu)
+    r: dict = {"bytes": nbytes}
+    if kernel_us and kernel_us > 0:
+        r["achieved_gbps"] = round(nbytes / kernel_us / 1e3, 1)
+    if peak:
+        r["peak_gbps"] = peak
+        r["floor_us"] = round(nbytes / peak / 1e3, 2)
+        if r.get("achieved_gbps"):
+            r["pct_peak"] = round(100.0 * r["achieved_gbps"] / peak, 1)
+    pct = r.get("pct_peak")
+    if pct is None:
+        r["regime"] = "unknown"
+        r["hint"] = "set CAUSAL_CONV1D_PEAK_GBPS for this device to get a roofline %"
+    elif pct >= 75:
+        r["regime"] = "memory-bound (near-peak)"
+        r["hint"] = "at the bandwidth roofline — no lever here; move to another shape"
+    elif pct < 40:
+        r["regime"] = "dispatch/latency-bound"
+        r["hint"] = (
+            "far below roofline — amortize per-call launch/sync overhead "
+            "(bigger/batched work), not the bandwidth path"
+        )
+    else:
+        r["regime"] = "partial"
+        r["hint"] = (
+            f"{pct:.0f}% of peak — some headroom; check the AIR instruction mix "
+            "(_metal_introspect.py) and access pattern"
+        )
+    return r
+
+
 def _assemble_report(cfg, args, env_sig, tag, results: dict[str, Measurement]) -> dict:
     out_results = {
         impl: {
@@ -1304,7 +1407,7 @@ def _assemble_report(cfg, args, env_sig, tag, results: dict[str, Measurement]) -
                 ratios[f"mojo_over_{base}"] = (
                     results["mojo"].min_us / results[base].min_us
                 )
-    return {
+    rep = {
         "fn": cfg.fn,
         "shape": list(cfg.shape),
         "measure": args.measure,
@@ -1317,6 +1420,12 @@ def _assemble_report(cfg, args, env_sig, tag, results: dict[str, Measurement]) -
         "results": out_results,
         "ratio_min": ratios,
     }
+    # Roofline verdict on the best mojo kernel time — the "is this number
+    # good?" the agent needs. Only for kernel-time (walltime includes
+    # launch/sync overhead, so bytes/walltime isn't a real bandwidth).
+    if args.measure == "kernel" and "mojo" in results and results["mojo"].runs_us:
+        rep["roofline"] = _roofline(cfg, results["mojo"].min_us, env_sig.get("gpu", ""))
+    return rep
 
 
 # ---------------------------------------------------------------------------
@@ -1359,6 +1468,19 @@ def _print_human(rep: dict) -> None:
         base = name.replace("mojo_over_", "")
         verdict = _verdict(ratio, rep, ("mojo", base))
         print(f"  ratio {name}: {ratio:.3f}x  {verdict}")
+    rl = rep.get("roofline")
+    if rl:
+        moved = f"{rl['bytes'] / 1e6:.1f} MB"
+        ach = f"{rl['achieved_gbps']} GB/s" if rl.get("achieved_gbps") else "?"
+        if rl.get("pct_peak") is not None:
+            print(
+                f"  roofline: {moved} moved | {ach} = {rl['pct_peak']}% of "
+                f"{rl['peak_gbps']:.0f} GB/s peak | floor {rl['floor_us']}us | "
+                f"{rl['regime']}"
+            )
+        else:
+            print(f"  roofline: {moved} moved | {ach} achieved | {rl['regime']}")
+        print(f"    -> {rl['hint']}")
     if rep.get("metal_analysis"):
         _print_metal_analysis(rep["metal_analysis"])
 

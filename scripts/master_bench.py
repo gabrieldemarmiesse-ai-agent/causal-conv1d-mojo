@@ -614,6 +614,51 @@ def bench_kernel(
     return reps
 
 
+def _print_roofline(rows: list[dict]) -> None:
+    """Memory-roofline verdict per shape (computed in _bench.py): bytes
+    moved, achieved GB/s, % of the device's peak, and a regime — the
+    'is this number good?' an agent needs to decide where to spend effort."""
+    have = [r for r in rows if r.get("roofline")]
+    if not have:
+        return
+    print(f"\n  {'shape':>18} | {'moved':>9} | {'achieved':>11} | {'%peak':>6} | regime")
+    print("  " + "-" * 72)
+    hints = []
+    for r in have:
+        rl = r["roofline"]
+        moved = f"{rl['bytes'] / 1e6:.1f}MB"
+        ach = f"{rl.get('achieved_gbps', '?')}GB/s"
+        pct = f"{rl['pct_peak']:.0f}%" if rl.get("pct_peak") is not None else "?"
+        print(
+            f"  {str(tuple(r['shape'])):>18} | {moved:>9} | {ach:>11} | "
+            f"{pct:>6} | {rl['regime']}"
+        )
+        # Collect the actionable hints (skip near-peak "no lever" shapes).
+        if rl.get("regime") not in ("memory-bound (near-peak)",) and rl.get("hint"):
+            hints.append((str(tuple(r["shape"])), rl["hint"]))
+    for shape, hint in hints:
+        print(f"    {shape}: {hint}")
+
+
+def _agent_row(r: dict) -> dict:
+    """Compact, machine-readable per-shape record for the AGENT-SUMMARY."""
+    rl = r.get("roofline") or {}
+    hl = (r.get("metal_analysis") or {}).get("headline") or {}
+    kus = hl.get("median_us") or r["results"].get("mojo", {}).get("min_us")
+    return {
+        "fn": r["fn"],
+        "shape": r["shape"],
+        "dtype": r["config"].get("dtype"),
+        "channel_last": r["config"].get("channel_last", False),
+        "kernel_us": round(kus, 2) if kus else None,
+        "achieved_gbps": rl.get("achieved_gbps"),
+        "pct_peak": rl.get("pct_peak"),
+        "regime": rl.get("regime"),
+        "hint": rl.get("hint"),
+        "ratio_over_upstream": r["ratio_min"].get("mojo_over_upstream"),
+    }
+
+
 def _aggregate_ratio(be: Backend, rows: list[dict]) -> None:
     """mojo-vs-baseline table. Gates (fails) only when ``be.gate_ratio``."""
     if not rows:
@@ -687,6 +732,7 @@ def _aggregate_ratio(be: Backend, rows: list[dict]) -> None:
         # No hand-tuned baseline here — the ratio is mojo-vs-naive-fallback,
         # reported for context, not gated.
         print(f"  worst mojo/{base} ratio: {worst:.3f}x  (informational, not a gate)")
+    _print_roofline(rows)
 
 
 # No external reference exists on Apple (upstream is CUDA-only), so the
@@ -766,6 +812,15 @@ def _aggregate_absolute(rows: list[dict], *, refresh: bool = False) -> None:
                 f"no usable metal kernel timing on {tuple(r['shape'])}: "
                 f"{mojo.get('error') or 'empty headline'}"
             )
+        elif clock != "Maximum":
+            # The kernel time is only comparable at Maximum GPU clock. A
+            # throttled or unknown-clock run (thermal, or the induced-max
+            # template didn't land the perf-state table) is INCONCLUSIVE,
+            # not a regression — never fail the gate or touch the baseline
+            # on it, or thermal noise would spuriously fail CI and a slow
+            # sample could poison the ratchet high.
+            note = (note + "; " if note else "") + "inconclusive (clock != Maximum)"
+            warn(f"{tuple(r['shape'])}: clock {clock!r}, not Maximum — skipping gate")
         else:
             key = _metal_baseline_key(r)
             prev = baseline.get(key)
@@ -795,6 +850,7 @@ def _aggregate_absolute(rows: list[dict], *, refresh: bool = False) -> None:
         _METAL_BASELINE.parent.mkdir(parents=True, exist_ok=True)
         _METAL_BASELINE.write_text(json.dumps(baseline, indent=1, sort_keys=True))
         print(f"  (baseline updated: {_METAL_BASELINE.relative_to(REPO)})")
+    _print_roofline(rows)
 
 
 # --------------------------------------------------------------------------
@@ -1388,6 +1444,7 @@ def main() -> int:
 
         signal.signal(signal.SIGTERM, _on_signal)
         signal.signal(signal.SIGHUP, _on_signal)
+    agent_rows: list[dict] = []
     try:
         # (b) correctness is tier-based and covers every function family.
         if args.skip_correctness:
@@ -1416,6 +1473,7 @@ def main() -> int:
                 baseline_flags,
                 metal_refresh=args.refresh_baseline,
             )
+            agent_rows.extend(_agent_row(r) for r in reps)
             profiler(be, fn, dtype, sh["canon"], args.skip_ncu, reps)
             if not args.skip_asm:
                 assembly(be, fn, dtype, sh["canon"], args.refresh_reference)
@@ -1434,6 +1492,22 @@ def main() -> int:
             unlock_clocks(be)
 
     section("summary")
+    # Machine-readable block for an agent driving a perf loop: one JSON
+    # object with per-shape kernel time + roofline verdict + regime/hint,
+    # delimited so it can be sliced out of the full log without scraping
+    # the human tables. Kept compact and stable-keyed.
+    if agent_rows:
+        summary = {
+            "backend": be.name,
+            "device": be.pretty,
+            "tier": tier,
+            "dtype": dtype,
+            "gate": "fail" if Gate.failed else "pass",
+            "shapes": agent_rows,
+        }
+        print("===AGENT-SUMMARY===")
+        print(json.dumps(summary))
+        print("===END-AGENT-SUMMARY===")
     if Gate.failed:
         print(f"ISSUES — one or more gates failed above (fn={args.fn} tier={tier})")
         return 1

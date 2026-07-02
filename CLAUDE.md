@@ -167,7 +167,18 @@ exist**:
   contributing its foreign-encoder-filtered headline median as one run);
   the master bench records 1 in quick tier / 3 in `--full`. The
   metal *walltime* step (h) is tagged `unlocked` — the clock lock is an
-  xctrace template, so it never applies outside recordings.
+  xctrace template, so it never applies outside recordings. Every backend
+  also prints a **memory-roofline verdict** per shape (bytes moved,
+  achieved GB/s, % of the device's peak DRAM bandwidth, theoretical floor
+  time, and a regime + one-line hint) — the "is this number good?" an
+  agent needs to decide whether a shape has headroom (`memory-bound
+  (near-peak)` → move on; `dispatch/latency-bound` → amortize launch).
+  Peak BW is keyed per device with a `CAUSAL_CONV1D_PEAK_GBPS` override
+  and *printed*, so the % is never a black box; an unknown device omits
+  the % rather than inventing one. On metal the roofline % is only trusted
+  at Maximum clock — a throttled/unknown-clock run is marked `throttled`
+  and the regression gate treats it as **inconclusive** (warn, don't fail,
+  don't touch the baseline) so thermal noise can't spuriously fail CI.
 - **(d) deep profiler** — cuda: `ncu` (ephemeral via `pixi exec`); metal:
   the per-encoder GPU time + clock split + duty cycle already parsed from
   the step-(c) trace; cpu: `perf stat`; rocm: skipped (`rocprofv3` can't
@@ -184,6 +195,14 @@ exist**:
 - **(h)** independent `torch.utils.benchmark` wall-clock run.
 
 Steps c/d/h are deliberately separate processes.
+
+The `summary` section ends with a machine-readable **`===AGENT-SUMMARY===`**
+block (one JSON object: backend, device, tier, gate pass/fail, and a
+per-shape list of `{fn, shape, dtype, kernel_us, achieved_gbps, pct_peak,
+regime, hint, ratio_over_upstream}`). An agent driving a perf loop can
+slice that out between the delimiters instead of scraping the human
+tables — it's the fastest way to see, per shape, whether there's headroom
+and what to try next.
 
 ```bash
 python scripts/master_bench.py                 # QUICK tier, auto-detect (every edit)
