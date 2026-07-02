@@ -405,41 +405,79 @@ def fwd_channellast_kernel[
     """
     comptime accum_t = DType.float32
     comptime kNElts: Int = kNEltsFwd[dtype]()
+    # Channels covered by one block (one smem weight-tile row per tap).
+    comptime kChunkC: Int = kNThreadsCL * kNElts
 
+    # Grid is (L-chunks, batch, C-chunks): the seqlen-chunk count is the
+    # only axis that can get huge (seqlen / rows_per_block), so it rides
+    # grid.x (2^31-1 cap) — grid.y/z cap at 65535 on CUDA. Consecutive
+    # blocks along x are consecutive L-chunks of the same (batch, C)
+    # slice, so a block's (W-1)-row halo re-read hits rows its x-1
+    # neighbour just pulled into L2.
     var tidx: Int = thread_idx.x
-    var batch_id: Int = block_idx.x
-    var chunk_l: Int = block_idx.y
+    var chunk_l: Int = block_idx.x
+    var batch_id: Int = block_idx.y
     var chunk_c: Int = block_idx.z
 
     # This thread's kNElts consecutive channels.
     var c0: Int = (chunk_c * kNThreadsCL + tidx) * kNElts
+
+    # ---- Stage the block's weight tile through smem (coalesced) ----
+    # A naive per-thread read of its own taps
+    # (`w_ptr[(c0+i)*w_c_stride + j]`, 32 scalar loads with a 64-byte
+    # warp stride) shreds L1 sectors — ncu showed it costing ~8x
+    # upstream's total load-sector count and dominating kernel time. So
+    # the whole block cooperatively copies its (kChunkC x kWidth) weight
+    # tile with *adjacent* threads touching *adjacent* elements, and
+    # each thread then reads its taps back from smem. Layout is
+    # transposed (tap-major, `[j][c_local]`) so the read-back below is a
+    # conflict-free 16-byte smem vector per tap.
+    var w_smem = stack_allocation[
+        kWidth * kChunkC,
+        Scalar[dtype],
+        address_space = AddressSpace.SHARED,
+        alignment=16,
+    ]()
+
+    comptime for it in range(kNElts * kWidth):
+        var e: Int = it * kNThreadsCL + tidx
+        var c_local: Int = e % kChunkC
+        var j: Int = e // kChunkC
+        var c: Int = chunk_c * kChunkC + c_local
+        w_smem[j * kChunkC + c_local] = (
+            w_ptr[c * Int(w_c_stride) + j] if c < dim else Scalar[dtype](0)
+        )
+    barrier()
+
+    # No thread may exit before the staging barrier above, so the
+    # out-of-range check lives here rather than at the top.
     if c0 >= dim:
         return
 
     var x_base = x_ptr + batch_id * Int(x_b_stride) + c0
     var o_base = o_ptr + batch_id * Int(o_b_stride) + c0
 
-    # ---- Load this thread's weights once (fp32 registers) ----
-    # weight is (dim, width) with width contiguous; per channel lane i,
-    # taps live at w_ptr[(c0+i)*w_c_stride + j].
+    # ---- This thread's weights: 16-byte smem vector per tap ----
     var w_vecs = InlineArray[SIMD[accum_t, kNElts], kWidth](
         fill=SIMD[accum_t, kNElts](0)
     )
 
     comptime for j in range(kWidth):
+        w_vecs[j] = (
+            (w_smem + j * kChunkC + tidx * kNElts)
+            .load[width=kNElts, alignment=16]()
+            .cast[accum_t]()
+        )
 
-        comptime for i in range(kNElts):
-            w_vecs[j][i] = w_ptr[(c0 + i) * Int(w_c_stride) + j].cast[
-                accum_t
-            ]()
-
-    # ---- Bias (unit stride, same assumption as fwd_kernel) ----
+    # ---- Bias: one 16-byte vector (unit stride; c0*sizeof is 16B-
+    # aligned because c0 is a multiple of kNElts, and c0 < dim with
+    # dim % kNElts == 0 keeps the vector in bounds) ----
     var bias_vec = SIMD[accum_t, kNElts](0)
 
     comptime if has_bias:
-
-        comptime for i in range(kNElts):
-            bias_vec[i] = bias_ptr[c0 + i].cast[accum_t]()
+        bias_vec = (
+            (bias_ptr + c0).load[width=kNElts, alignment=16]().cast[accum_t]()
+        )
 
     var l0: Int = chunk_l * rows_per_block
     var l_end: Int = min(l0 + rows_per_block, seqlen)
@@ -473,7 +511,63 @@ def fwd_channellast_kernel[
                     ].cast[accum_t]()
 
     # ---- Walk the chunk's rows; slide the halo in registers ----
-    for l in range(l0, l_end):
+    # Unrolled by kUnroll: each iteration issues kUnroll *independent*
+    # x-row vector loads before any of them is consumed. With the
+    # register-capped occupancy of this kernel (~20 warps/SM), a
+    # one-row-at-a-time walk leaves each warp stalled on its single
+    # outstanding load (ncu: long_scoreboard dominant); 4 loads in
+    # flight per warp quarters that. The window shift also folds into
+    # register renaming instead of per-row vector moves.
+    # The epilogue's window shift below indexes xv[kUnroll-kWidth+1+j],
+    # so this kernel requires kWidth-1 <= kUnroll (a negative comptime
+    # index fails the InlineArray bounds constraint at mojo-build time).
+    # The dispatcher (`channel_last` in fwd/_jit.py) therefore routes
+    # width > kUnroll+1 (= 5) to the generic kernel — keep the two in
+    # sync if kUnroll changes.
+    comptime kUnroll: Int = 4
+
+    var l: Int = l0
+    while l + kUnroll <= l_end:
+        var xv = InlineArray[SIMD[accum_t, kNElts], kUnroll](
+            fill=SIMD[accum_t, kNElts](0)
+        )
+
+        comptime for u in range(kUnroll):
+            xv[u] = (
+                (x_base + (l + u) * Int(x_l_stride))
+                .load[width=kNElts, alignment=16]()
+                .cast[accum_t]()
+            )
+
+        comptime for u in range(kUnroll):
+            var acc = bias_vec
+
+            comptime for j in range(kWidth):
+                # Tap j of output row (l+u) reads input row
+                # (l+u) - (kWidth-1) + j: still in the carried window
+                # when that offset is negative, else one of this
+                # iteration's fresh rows.
+                comptime s = u - (kWidth - 1) + j
+                comptime if s < 0:
+                    acc = w_vecs[j].fma(window[kWidth - 1 + s], acc)
+                else:
+                    acc = w_vecs[j].fma(xv[s], acc)
+
+            comptime if apply_silu:
+
+                comptime for i in range(kNElts):
+                    acc[i] = _silu_f32(Float32(acc[i]))
+
+            (o_base + (l + u) * Int(o_l_stride)).store[alignment=16](
+                acc.cast[dtype]()
+            )
+
+        comptime for j in range(kWidth - 1):
+            window[j] = xv[kUnroll - (kWidth - 1) + j]
+        l += kUnroll
+
+    # Remainder rows (< kUnroll of them), one at a time.
+    while l < l_end:
         var x_now = (
             (x_base + l * Int(x_l_stride))
             .load[width=kNElts, alignment=16]()
@@ -498,3 +592,4 @@ def fwd_channellast_kernel[
         comptime for j in range(kWidth - 2):
             window[j] = window[j + 1]
         window[kWidth - 2] = x_now
+        l += 1
