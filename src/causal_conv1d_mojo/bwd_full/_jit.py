@@ -42,9 +42,17 @@ _KN_ELTS_NARROW = 4
 _KNTHREADS = 128
 
 
-def call_bwd_full(args: tuple) -> None:
-    """JIT-compile (if needed) and dispatch a single bwd_full call."""
+def call_bwd_full(args: tuple, pre_dispatch: Callable[[], None] | None = None) -> None:
+    """JIT-compile (if needed) and dispatch a single bwd_full call.
+
+    ``pre_dispatch`` runs after the (possibly seconds-long) JIT compile
+    and immediately before the launch — the MPS path uses it to revive
+    the argument tensors' MTLHeaps inside the driver's ~1 s residency
+    window (see ``_mps.revive_heaps``).
+    """
     variant_fn, ctx_handle = _get_variant_fn(_config_from_args(args))
+    if pre_dispatch is not None:
+        pre_dispatch()
     # Tack ctx_handle on as the 41st positional arg — the variant
     # entry point destructures `args[40]` for it. (args[39] is the
     # `use_external_stream` flag, already a comptime define.)

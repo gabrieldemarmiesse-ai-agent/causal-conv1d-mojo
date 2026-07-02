@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from causal_conv1d_mojo._dtype import _DTYPE_CODE, _ptr
-from causal_conv1d_mojo._mps import gpu_address, gpu_address_or_zero
+from causal_conv1d_mojo._mps import gpu_address, gpu_address_or_zero, revive_heaps
 
 
 def native_fwd(
@@ -83,7 +83,15 @@ def native_fwd_mps(
     """
     from causal_conv1d_mojo.fwd._jit import call_fwd
 
-    torch.mps.synchronize()
+    def _pre_dispatch() -> None:
+        # Runs post-JIT-compile, right before the launch: make every
+        # argument tensor's MTLHeap resident (macOS evicts idle GPU
+        # memory after ~1 s, and Mojo doesn't declare foreign buffers
+        # to its encoder — see _mps.revive_heaps), then flush torch's
+        # queue so pending torch writes land before our kernel reads.
+        revive_heaps(x, weight, bias, seq_idx, initial_states, out)
+        torch.mps.synchronize()
+
     call_fwd(
         (
             gpu_address(x),
@@ -116,5 +124,6 @@ def native_fwd_mps(
             initial_states.stride(1) if initial_states is not None else 0,
             initial_states.stride(2) if initial_states is not None else 0,
             0,  # use_external_stream: Metal path enqueues on ctx
-        )
+        ),
+        pre_dispatch=_pre_dispatch,
     )

@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from causal_conv1d_mojo._dtype import _DTYPE_CODE, _ptr
-from causal_conv1d_mojo._mps import gpu_address, gpu_address_or_zero
+from causal_conv1d_mojo._mps import gpu_address, gpu_address_or_zero, revive_heaps
 
 
 def native_update(
@@ -76,7 +76,12 @@ def native_update_mps(
     """
     from causal_conv1d_mojo.update._jit import call_update
 
-    torch.mps.synchronize()
+    def _pre_dispatch() -> None:
+        # Post-compile, pre-launch: revive every argument tensor's
+        # MTLHeap (see _mps.revive_heaps), then flush torch's queue.
+        revive_heaps(x, weight, bias, conv_state, state_indices, cache_seqlens, out)
+        torch.mps.synchronize()
+
     call_update(
         (
             gpu_address(x),
@@ -109,5 +114,6 @@ def native_update_mps(
             int(cache_seqlens is not None),
             gpu_address_or_zero(cache_seqlens),
             0,  # use_external_stream: Metal path enqueues on ctx
-        )
+        ),
+        pre_dispatch=_pre_dispatch,
     )

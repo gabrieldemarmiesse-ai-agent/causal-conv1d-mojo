@@ -834,8 +834,16 @@ def _record_trace(child_argv: list[str], trace: str, *, attempts: int = 6) -> No
     deterministic, so retry until the intervals table actually exports back.
     The traced child inherits `_TRACED_ENV=1` so it runs the bare workload
     loop instead of recursively orchestrating another trace.
+
+    Heap revival (`_mps.revive_heaps`) is disabled in the child: its tiny
+    torch touch kernels would land in the same unlabeled Compute group as
+    the conv kernel and pollute the per-encoder stats. This is
+    measurement-safe — a busy dispatch loop keeps the GPU from idling, and
+    idle-eviction (the thing revival guards against) only strikes after
+    ~1 s of device inactivity; verified by a 3 s revival-off update loop
+    (60k calls) whose final output still matched the reference exactly.
     """
-    env = {**os.environ, _TRACED_ENV: "1"}
+    env = {**os.environ, _TRACED_ENV: "1", "CAUSAL_CONV1D_MPS_REVIVE": "off"}
     for attempt in range(1, attempts + 1):
         if os.path.exists(trace):
             shutil.rmtree(trace, ignore_errors=True)
@@ -867,6 +875,12 @@ def _record_trace(child_argv: list[str], trace: str, *, attempts: int = 6) -> No
 # least-throttled group as the headline when full Maximum clock never landed.
 _CLOCK_RANK = {"Minimum": 0, "Low": 1, "Medium": 2, "High": 3, "Maximum": 4}
 
+# GPU duty-cycle threshold below which a metal run is flagged
+# launch/sync-bound. Single source of truth: master_bench.py's table
+# consumes the note computed from this in `_summarize_trace` rather than
+# re-implementing the threshold.
+_DUTY_LAUNCH_BOUND_PCT = 40.0
+
 
 def _pick_headline(groups: list[dict]) -> dict | None:
     """The conv kernel's group: the `Compute Command` encoder, at the highest
@@ -893,29 +907,45 @@ def _pick_headline(groups: list[dict]) -> dict | None:
 
 
 def _summarize_trace(
-    trace: str, *, process: str = "python"
+    trace: str, *, process: str = "python", expected_iters: int | None = None
 ) -> tuple[dict, list[float]]:
     """Parse the trace into a structured Instruments analysis.
 
     Returns (analysis_dict, headline_durs_us) where the analysis lists every
     GPU encoder grouped by (channel, label, clock) and headline_durs_us is
     the per-interval µs list for the conv kernel (for min/spread reporting).
+
+    ``expected_iters`` guards the headline against contamination: Mojo
+    doesn't label its Metal encoders, so torch's own compute dispatches
+    inside the traced region (autograd bookkeeping for the bwd callable,
+    dtype casts, ...) land in the *same* unlabeled Compute group as our
+    kernel — and so do the child's *warmup* dispatches, which are
+    kernel-sized and can't be told apart by duration. Two-stage filter:
+    (1) drop intervals smaller than a quarter of the group's largest
+    (foreign torch encoders are tiny next to the conv kernel), then
+    (2) keep the chronologically LAST ``expected_iters`` of what remains
+    (warmup dispatches run first, so this excludes them without biasing
+    the kept sample toward slow iterations the way a keep-largest rule
+    would). The number of discarded intervals is surfaced as
+    ``headline_excluded``; ``headline_short`` flags a recording whose
+    final count came up short of ``expected_iters``.
     """
     windows = _load_clock_timeline(trace)
-    bucket: dict[tuple[str, str, str], list[int]] = defaultdict(list)
+    bucket: dict[tuple[str, str, str], list[tuple[int, int]]] = defaultdict(list)
     n = 0
     grand_ns = 0
     for channel, label, start_ns, ns in _parse_intervals(
         _xctrace_export(trace, _XCTRACE_SCHEMA), process
     ):
         clock = _clock_at(windows, start_ns) or "?"
-        bucket[(channel, label, clock)].append(ns)
+        bucket[(channel, label, clock)].append((start_ns, ns))
         n += 1
         grand_ns += ns
 
     groups: list[dict] = []
-    headline_by_key: dict[tuple, list[int]] = {}
-    for (channel, label, clock), durs in bucket.items():
+    headline_by_key: dict[tuple, list[tuple[int, int]]] = {}
+    for (channel, label, clock), pairs in bucket.items():
+        durs = [ns for _, ns in pairs]
         groups.append(
             {
                 "channel": channel,
@@ -930,14 +960,50 @@ def _summarize_trace(
                 "total_us": sum(durs) / 1e3,
             }
         )
-        headline_by_key[(channel, label, clock)] = durs
+        headline_by_key[(channel, label, clock)] = pairs
     groups.sort(key=lambda g: -g["total_us"])
 
     headline = _pick_headline(groups)
     headline_durs = []
+    headline_excluded = 0
+    headline_short = False
     if headline is not None:
         key = (headline["channel"], headline["label"], headline["clock"])
-        headline_durs = [d / 1e3 for d in headline_by_key[key]]
+        pairs = headline_by_key[key]
+        durs = [ns for _, ns in pairs]
+        if expected_iters is not None and expected_iters > 0:
+            # (1) size: drop tiny foreign encoders.
+            biggest = max(durs)
+            sized = [(s, ns) for s, ns in pairs if ns * 4 >= biggest]
+            # (2) time: warmup dispatches run before the timed loop.
+            sized.sort(key=lambda p: p[0])
+            kept = sized[-expected_iters:]
+            headline_excluded = len(pairs) - len(kept)
+            headline_short = len(kept) < expected_iters
+            durs = [ns for _, ns in kept]
+            if headline_excluded:
+                # Re-derive the headline's stats from the filtered set so
+                # the printed number and Measurement agree (the raw,
+                # contaminated group row stays visible in the table).
+                headline = {
+                    **headline,
+                    "count": len(durs),
+                    "median_us": statistics.median(durs) / 1e3,
+                    "min_us": min(durs) / 1e3,
+                    "max_us": max(durs) / 1e3,
+                    "total_us": sum(durs) / 1e3,
+                }
+        headline_durs = [d / 1e3 for d in durs]
+
+    duty = _gpu_duty_cycle(trace)
+    # One-line health note, computed here (single source of truth) so
+    # master_bench.py's table can print it without re-implementing the
+    # thresholds. Empty string = healthy.
+    note = ""
+    if headline is not None and windows and headline["clock"] != "Maximum":
+        note = "DVFS-throttled (not steady state)"
+    elif duty and duty["busy_pct"] < _DUTY_LAUNCH_BOUND_PCT:
+        note = "launch/sync-bound (low GPU residency)"
 
     analysis = {
         "trace": trace,
@@ -945,20 +1011,49 @@ def _summarize_trace(
         "clock_windows": bool(windows),
         "groups": groups,
         "headline": headline,
+        "headline_excluded": headline_excluded,
+        "headline_short": headline_short,
         "intervals": n,
         "total_gpu_ms": grand_ns / 1e6,
-        "duty": _gpu_duty_cycle(trace),
+        "duty": duty,
+        "note": note,
     }
     return analysis, headline_durs
+
+
+def _canary_check(result) -> str:
+    """Cheap output-validity check on a kernel result: 'ok', or why not.
+
+    Targets the known Mojo/Metal silent-failure class (a dispatch against
+    an idle-evicted heap reads zeros / drops writes, see _mps.revive_heaps
+    in the package): with random inputs, an all-zero output tensor is
+    (essentially) impossible legitimately, so it's a reliable canary. Also
+    rejects NaN/Inf. `result` is whatever the impl callable returned — a
+    tensor or a tuple of tensors (the bwd callable returns grads).
+    """
+    tensors = result if isinstance(result, (tuple, list)) else (result,)
+    for t in tensors:
+        if t is None or not torch.is_tensor(t):
+            continue
+        f = t.float()
+        if not torch.isfinite(f).all().item():
+            return "non-finite values in output"
+        if f.abs().max().item() == 0.0:
+            return "all-zero output (silently lost dispatch?)"
+    return "ok"
 
 
 def run_metal_kernel(cfg: Config, args, env_sig: dict, tag: str) -> dict:
     """Orchestrate the Apple kernel-time measurement and assemble the report.
 
-    Pre-warms the JIT cache (un-traced subprocess), records a Metal System
-    Trace around the workload, parses the per-encoder GPU intervals, and
-    returns a report carrying both the headline kernel time (mojo) and the
-    full Instruments analysis (`metal_analysis`).
+    Pre-warms the JIT cache (un-traced subprocess), runs a one-call output
+    canary in-process, then records `--runs` independent Metal System
+    Traces around the workload. Each recording contributes one number (the
+    filtered-headline median of its per-encoder GPU intervals) to the
+    Measurement, so `min (us)` / `spread` mean the same thing they mean on
+    the CUDA path: best-of-N independent repetitions and their scatter.
+    The full Instruments analysis of the best recording is attached as
+    `metal_analysis`.
     """
     if shutil.which("xctrace") is None:
         raise SystemExit(
@@ -979,21 +1074,92 @@ def run_metal_kernel(cfg: Config, args, env_sig: dict, tag: str) -> dict:
             f"{warm.stdout}\n{warm.stderr}"
         )
 
-    # 2) Record the Metal System Trace around a re-launch of the workload.
-    trace_dir = tempfile.mkdtemp(prefix="ccv_metal_")
-    trace = os.path.join(trace_dir, f"ccv_{cfg.fn}.trace")
-    child = _workload_argv(cfg, args, iters=args.iters, warmup=1)
-    print(f"\n=== xctrace record (Metal System Trace) -> {trace} ===")
-    _record_trace(child, trace)
+    # 2) Output canary, in-process with the normal production path (heap
+    #    revival on): xctrace only measures time — a silently-corrupted
+    #    dispatch has a perfectly normal duration, so validity must be
+    #    checked on the values, once, here.
+    canary = _canary_check(make_callable("mojo", cfg)())
 
-    # 3) Read per-encoder GPU intervals back out.
-    analysis, headline_durs = _summarize_trace(trace)
-    m = Measurement(runs_us=headline_durs)
-    if not headline_durs:
-        m.error = "no Compute GPU intervals found in trace"
+    # 3) Record `--runs` independent traces; each yields one headline number.
+    trace_dir = tempfile.mkdtemp(prefix="ccv_metal_")
+    child = _workload_argv(cfg, args, iters=args.iters, warmup=5)
+    n_recs = max(1, args.runs)
+    run_medians: list[float] = []
+    best: tuple[float, dict] | None = None  # (median, analysis)
+    last_analysis: dict = {}
+    other_notes: list[str] = []
+    for rec in range(n_recs):
+        trace = os.path.join(trace_dir, f"ccv_{cfg.fn}_r{rec}.trace")
+        print(
+            f"\n=== xctrace record {rec + 1}/{n_recs} "
+            f"(Metal System Trace) -> {trace} ==="
+        )
+        _record_trace(child, trace)
+        analysis, headline_durs = _summarize_trace(
+            trace, expected_iters=args.iters
+        )
+        last_analysis = analysis
+        if analysis.get("note"):
+            other_notes.append(analysis["note"])
+        if analysis.get("headline_short"):
+            other_notes.append("fewer kernel intervals than iters in a trace")
+        if not headline_durs:
+            continue
+        med = statistics.median(headline_durs)
+        run_medians.append(med)
+        if best is None or med < best[0]:
+            best = (med, analysis)
+
+    analysis = dict(best[1]) if best is not None else last_analysis
+    # A healthy best recording must not mask trouble in its siblings —
+    # surface any note raised by ANY recording (throttling, undercounts).
+    cross = sorted(set(other_notes) - {analysis.get("note", "")})
+    if cross:
+        merged = "; ".join(
+            filter(None, [analysis.get("note", ""), *cross])
+        )
+        analysis["note"] = f"{merged} (some recordings)"
+    if 0 < len(run_medians) < n_recs:
+        analysis["note"] = (
+            (analysis.get("note", "") + "; " if analysis.get("note") else "")
+            + f"only {len(run_medians)}/{n_recs} recordings parsed"
+        )
+
+    # Keep the best recording's .trace for Instruments; the rest are
+    # tens-to-hundreds of MB each and already reduced to numbers.
+    keep = analysis.get("trace")
+    for entry in os.listdir(trace_dir):
+        full = os.path.join(trace_dir, entry)
+        if full != keep:
+            shutil.rmtree(full, ignore_errors=True)
+
+    errors = []
+    if not run_medians:
+        errors.append("no Compute GPU intervals found in any trace")
+    if canary != "ok":
+        errors.append(f"canary: {canary}")
+    m = Measurement(runs_us=run_medians)
+    if errors:
+        m.error = "; ".join(errors)
 
     rep = _assemble_report(cfg, args, env_sig, tag, {"mojo": m})
+    rep["canary"] = canary
     rep["metal_analysis"] = analysis
+    # The roofline % divides bytes by the measured kernel time, so it's
+    # only trustworthy at Maximum GPU clock — a throttled run inflates the
+    # time and makes a memory-bound kernel look dispatch-bound. If the
+    # headline clock isn't Maximum, mark the verdict unreliable rather than
+    # let an agent act on a downclock artifact.
+    rl = rep.get("roofline")
+    hl = (analysis or {}).get("headline") or {}
+    if rl and hl.get("clock") != "Maximum":
+        rl["clock_unreliable"] = True
+        rl["regime"] = "throttled (clock != Maximum)"
+        rl["hint"] = (
+            f"measured at {hl.get('clock', '?')} clock, not Maximum — the "
+            "roofline % is a downclock artifact; re-run under master_bench's "
+            "lock phase before trusting the regime"
+        )
     return rep
 
 
@@ -1135,6 +1301,94 @@ def _measure_impl(impl: str, cfg: Config, args) -> Measurement:
     return m
 
 
+# Peak DRAM bandwidth (GB/s) by device-name substring — used for the
+# roofline verdict. Memory-bound kernels can't beat this; % of it tells an
+# agent whether a shape has any bandwidth headroom left. Extend as needed;
+# CAUSAL_CONV1D_PEAK_GBPS overrides, and an unknown device omits %-of-peak
+# (reporting achieved GB/s only) rather than inventing a denominator.
+_PEAK_GBPS = {
+    "Apple M4 Max": 546.0,
+    "Apple M4 Pro": 273.0,
+    "Apple M4": 120.0,
+    "Apple M3 Max": 400.0,
+    "Apple M3 Pro": 150.0,
+    "Apple M3": 100.0,
+    "Apple M2": 100.0,
+    "Apple M1": 68.0,
+    "H100": 3350.0,
+    "A100": 2039.0,
+}
+_DTYPE_BYTES = {"fp16": 2, "bf16": 2, "fp32": 4}
+
+
+def _peak_gbps(gpu: str) -> float | None:
+    override = os.environ.get("CAUSAL_CONV1D_PEAK_GBPS")
+    if override:
+        return float(override)
+    # Longest matching key wins ("Apple M4 Pro" before "Apple M4").
+    for name in sorted(_PEAK_GBPS, key=len, reverse=True):
+        if name in gpu:
+            return _PEAK_GBPS[name]
+    return None
+
+
+def _bytes_moved(cfg: Config) -> int:
+    """Ideal global-memory traffic (bytes) for one call — the roofline
+    numerator. Each kernel touches every input/output element once
+    (that's the design goal), so this is the theoretical floor; real
+    traffic can only be >= this (halo re-reads, cache misses)."""
+    b = _DTYPE_BYTES.get(cfg.dtype, 2)
+    w = cfg.width
+    if cfg.fn in ("fwd", "bwd"):
+        B, D, L = cfg.shape[0], cfg.shape[1], cfg.shape[2]
+        elems = (
+            3 * B * D * L if cfg.fn == "bwd"  # read x + dout, write dx
+            else 2 * B * D * L                # read x, write out
+        )
+        elems += D * w + (D if cfg.has_bias else 0)  # weight + bias (small)
+        return elems * b
+    # update (decode): read x + state + weight, write out + state
+    B, D = cfg.shape[0], cfg.shape[1]
+    sl = cfg.state_len
+    return (2 * B * D + 2 * B * D * sl + D * w) * b
+
+
+def _roofline(cfg: Config, kernel_us: float, gpu: str) -> dict:
+    """Turn a measured kernel time into a memory-roofline verdict: achieved
+    GB/s, % of the device's peak, the theoretical floor time, and a
+    regime + one-line hint an agent can act on."""
+    nbytes = _bytes_moved(cfg)
+    peak = _peak_gbps(gpu)
+    r: dict = {"bytes": nbytes}
+    if kernel_us and kernel_us > 0:
+        r["achieved_gbps"] = round(nbytes / kernel_us / 1e3, 1)
+    if peak:
+        r["peak_gbps"] = peak
+        r["floor_us"] = round(nbytes / peak / 1e3, 2)
+        if r.get("achieved_gbps"):
+            r["pct_peak"] = round(100.0 * r["achieved_gbps"] / peak, 1)
+    pct = r.get("pct_peak")
+    if pct is None:
+        r["regime"] = "unknown"
+        r["hint"] = "set CAUSAL_CONV1D_PEAK_GBPS for this device to get a roofline %"
+    elif pct >= 75:
+        r["regime"] = "memory-bound (near-peak)"
+        r["hint"] = "at the bandwidth roofline — no lever here; move to another shape"
+    elif pct < 40:
+        r["regime"] = "dispatch/latency-bound"
+        r["hint"] = (
+            "far below roofline — amortize per-call launch/sync overhead "
+            "(bigger/batched work), not the bandwidth path"
+        )
+    else:
+        r["regime"] = "partial"
+        r["hint"] = (
+            f"{pct:.0f}% of peak — some headroom; check the AIR instruction mix "
+            "(_metal_introspect.py) and access pattern"
+        )
+    return r
+
+
 def _assemble_report(cfg, args, env_sig, tag, results: dict[str, Measurement]) -> dict:
     out_results = {
         impl: {
@@ -1153,7 +1407,7 @@ def _assemble_report(cfg, args, env_sig, tag, results: dict[str, Measurement]) -
                 ratios[f"mojo_over_{base}"] = (
                     results["mojo"].min_us / results[base].min_us
                 )
-    return {
+    rep = {
         "fn": cfg.fn,
         "shape": list(cfg.shape),
         "measure": args.measure,
@@ -1166,6 +1420,12 @@ def _assemble_report(cfg, args, env_sig, tag, results: dict[str, Measurement]) -
         "results": out_results,
         "ratio_min": ratios,
     }
+    # Roofline verdict on the best mojo kernel time — the "is this number
+    # good?" the agent needs. Only for kernel-time (walltime includes
+    # launch/sync overhead, so bytes/walltime isn't a real bandwidth).
+    if args.measure == "kernel" and "mojo" in results and results["mojo"].runs_us:
+        rep["roofline"] = _roofline(cfg, results["mojo"].min_us, env_sig.get("gpu", ""))
+    return rep
 
 
 # ---------------------------------------------------------------------------
@@ -1208,6 +1468,19 @@ def _print_human(rep: dict) -> None:
         base = name.replace("mojo_over_", "")
         verdict = _verdict(ratio, rep, ("mojo", base))
         print(f"  ratio {name}: {ratio:.3f}x  {verdict}")
+    rl = rep.get("roofline")
+    if rl:
+        moved = f"{rl['bytes'] / 1e6:.1f} MB"
+        ach = f"{rl['achieved_gbps']} GB/s" if rl.get("achieved_gbps") else "?"
+        if rl.get("pct_peak") is not None:
+            print(
+                f"  roofline: {moved} moved | {ach} = {rl['pct_peak']}% of "
+                f"{rl['peak_gbps']:.0f} GB/s peak | floor {rl['floor_us']}us | "
+                f"{rl['regime']}"
+            )
+        else:
+            print(f"  roofline: {moved} moved | {ach} achieved | {rl['regime']}")
+        print(f"    -> {rl['hint']}")
     if rep.get("metal_analysis"):
         _print_metal_analysis(rep["metal_analysis"])
 
@@ -1238,6 +1511,12 @@ def _print_metal_analysis(a: dict) -> None:
             f"    headline kernel time (Compute Command @ {h['clock']} clock, "
             f"median): {h['median_us']:.2f} us  (count={h['count']})"
         )
+        if a.get("headline_excluded"):
+            print(
+                f"    ({a['headline_excluded']} extra encoder interval(s) in the "
+                f"group excluded as foreign — torch casts/autograd/revival "
+                f"touches share the unlabeled Compute Command group)"
+            )
         if a["clock_windows"] and h["clock"] != "Maximum":
             print(
                 f"    WARNING: GPU never reached Maximum clock (best observed: "
@@ -1257,7 +1536,7 @@ def _print_metal_analysis(a: dict) -> None:
             f"    GPU duty cycle (device-global): {d['busy_pct']:.1f}% active  "
             f"({d['active_ms']:.2f} ms active / {d['idle_ms']:.2f} ms idle)"
         )
-        if d["busy_pct"] < 40.0:
+        if d["busy_pct"] < _DUTY_LAUNCH_BOUND_PCT:
             print(
                 "          -> low residency: launch/sync-bound, not compute-bound "
                 "(the per-call sync starves the GPU and holds the clock down)."

@@ -555,7 +555,9 @@ def correctness(be: Backend, tier: str, clean: bool) -> bool:
 # --------------------------------------------------------------------------
 
 
-def bench_kernel(be: Backend, fn, dtype, shapes, runs, clock, baseline_flags) -> list:
+def bench_kernel(
+    be: Backend, fn, dtype, shapes, runs, clock, baseline_flags, metal_refresh=False
+) -> list:
     measure = be.kernel_measure
     label = "GPU kernel time" if measure == "kernel" else "wall-clock"
     if be.name == "metal":
@@ -600,10 +602,61 @@ def bench_kernel(be: Backend, fn, dtype, shapes, runs, clock, baseline_flags) ->
         except json.JSONDecodeError:
             Gate.fail(f"bench produced no JSON on {shape}")
     if be.baseline is None:
-        _aggregate_absolute(reps)
+        # NOTE: deliberately NOT derived from baseline_flags — that list
+        # carries --refresh-baseline on every --full run to re-measure the
+        # CUDA upstream/pytorch caches, but reseeding the metal ratchet on
+        # every FULL run would mean the authoritative tier can never fail
+        # its own regression gate. Only an explicit --refresh-baseline
+        # reseeds the metal baseline.
+        _aggregate_absolute(reps, refresh=metal_refresh)
     else:
         _aggregate_ratio(be, reps)
     return reps
+
+
+def _print_roofline(rows: list[dict]) -> None:
+    """Memory-roofline verdict per shape (computed in _bench.py): bytes
+    moved, achieved GB/s, % of the device's peak, and a regime — the
+    'is this number good?' an agent needs to decide where to spend effort."""
+    have = [r for r in rows if r.get("roofline")]
+    if not have:
+        return
+    print(f"\n  {'shape':>18} | {'moved':>9} | {'achieved':>11} | {'%peak':>6} | regime")
+    print("  " + "-" * 72)
+    hints = []
+    for r in have:
+        rl = r["roofline"]
+        moved = f"{rl['bytes'] / 1e6:.1f}MB"
+        ach = f"{rl.get('achieved_gbps', '?')}GB/s"
+        pct = f"{rl['pct_peak']:.0f}%" if rl.get("pct_peak") is not None else "?"
+        print(
+            f"  {str(tuple(r['shape'])):>18} | {moved:>9} | {ach:>11} | "
+            f"{pct:>6} | {rl['regime']}"
+        )
+        # Collect the actionable hints (skip near-peak "no lever" shapes).
+        if rl.get("regime") not in ("memory-bound (near-peak)",) and rl.get("hint"):
+            hints.append((str(tuple(r["shape"])), rl["hint"]))
+    for shape, hint in hints:
+        print(f"    {shape}: {hint}")
+
+
+def _agent_row(r: dict) -> dict:
+    """Compact, machine-readable per-shape record for the AGENT-SUMMARY."""
+    rl = r.get("roofline") or {}
+    hl = (r.get("metal_analysis") or {}).get("headline") or {}
+    kus = hl.get("median_us") or r["results"].get("mojo", {}).get("min_us")
+    return {
+        "fn": r["fn"],
+        "shape": r["shape"],
+        "dtype": r["config"].get("dtype"),
+        "channel_last": r["config"].get("channel_last", False),
+        "kernel_us": round(kus, 2) if kus else None,
+        "achieved_gbps": rl.get("achieved_gbps"),
+        "pct_peak": rl.get("pct_peak"),
+        "regime": rl.get("regime"),
+        "hint": rl.get("hint"),
+        "ratio_over_upstream": r["ratio_min"].get("mojo_over_upstream"),
+    }
 
 
 def _aggregate_ratio(be: Backend, rows: list[dict]) -> None:
@@ -679,35 +732,125 @@ def _aggregate_ratio(be: Backend, rows: list[dict]) -> None:
         # No hand-tuned baseline here — the ratio is mojo-vs-naive-fallback,
         # reported for context, not gated.
         print(f"  worst mojo/{base} ratio: {worst:.3f}x  (informational, not a gate)")
+    _print_roofline(rows)
 
 
-def _aggregate_absolute(rows: list[dict]) -> None:
-    """Apple: absolute per-kernel GPU time read back from the Metal trace."""
+# No external reference exists on Apple (upstream is CUDA-only), so the
+# regression gate ratchets against this machine's own best history:
+# per-(fn, shape, dtype, config, gpu, clock) medians persisted here.
+_METAL_BASELINE = REPO / "scripts" / "baselines" / "metal_kernel_gpu_time.json"
+# Looser than CUDA's 3%-vs-upstream: even clock-locked medians scatter a
+# few % run-to-run on Apple, and the baseline is a best-ever ratchet
+# (always at the fast edge of the distribution), so give real headroom.
+_METAL_GATE_TOLERANCE = 1.10
+
+
+def _metal_baseline_key(r: dict) -> str:
+    cfg = {k: v for k, v in sorted((r.get("config") or {}).items())}
+    env = r.get("env") or {}
+    return json.dumps(
+        {
+            # Methodology version: bump to orphan old entries whenever the
+            # measurement's meaning changes (statistic, filtering, iters).
+            "v": 1,
+            "fn": r.get("fn"),
+            "shape": r.get("shape"),
+            "config": cfg,
+            "gpu": env.get("gpu"),
+            "clock": env.get("clock"),
+        },
+        sort_keys=True,
+    )
+
+
+def _aggregate_absolute(rows: list[dict], *, refresh: bool = False) -> None:
+    """Apple: absolute per-kernel GPU time read back from the Metal trace.
+
+    Gates two ways: (1) the output canary (an all-zero/non-finite result
+    means the kernel silently did nothing — timing alone can't see that);
+    (2) a ratcheting per-shape regression gate against this machine's own
+    best recorded median (there is no upstream to diff against on Apple).
+    A run slower than baseline * tolerance fails; a faster run lowers the
+    baseline. ``refresh`` (an explicit --refresh-baseline only — NOT
+    --full, which must be able to fail its own gate) reseeds
+    unconditionally — use it when an intentional change lands. Rows with
+    a failed canary or NaN timing fail the gate and never touch the
+    baseline.
+    """
     if not rows:
         Gate.fail("no parseable bench results")
         return
+    try:
+        baseline = json.loads(_METAL_BASELINE.read_text())
+    except (OSError, json.JSONDecodeError):
+        baseline = {}
+    baseline_dirty = False
+
     print(f"\n  {'shape':>18} | {'kernel us':>10} | {'clock':>8} | {'duty%':>6} | note")
     print("  " + "-" * 70)
     for r in rows:
         mojo = r["results"].get("mojo", {})
-        us = mojo.get("min_us", math.nan)
         a = r.get("metal_analysis") or {}
         h = a.get("headline") or {}
+        # Median of the (foreign-encoder-filtered) headline group of the
+        # best recording — the same statistic _bench.py's own analysis
+        # prints, so the two surfaces can't disagree. Falls back to the
+        # Measurement min.
+        us = h.get("median_us", mojo.get("min_us", math.nan))
         clock = h.get("clock", "?")
         duty = (a.get("duty") or {}).get("busy_pct", math.nan)
-        note = ""
-        if mojo.get("error"):
-            note = mojo["error"]
-        elif clock and clock != "Maximum":
-            note = "DVFS-throttled (not steady state)"
-        elif duty == duty and duty < 40.0:
-            note = "launch/sync-bound (low GPU residency)"
+        note = mojo.get("error") or a.get("note", "")
+
+        canary = r.get("canary", "ok")
+        if canary != "ok":
+            # A corrupt run must not seed or ratchet the baseline: a
+            # silently-lost dispatch does less work and can time *faster*
+            # than a healthy one, poisoning the ratchet low forever.
+            Gate.fail(f"output canary on {tuple(r['shape'])}: {canary}")
+        elif us != us:  # NaN: zero timing data is a gate failure, not a note
+            Gate.fail(
+                f"no usable metal kernel timing on {tuple(r['shape'])}: "
+                f"{mojo.get('error') or 'empty headline'}"
+            )
+        elif clock != "Maximum":
+            # The kernel time is only comparable at Maximum GPU clock. A
+            # throttled or unknown-clock run (thermal, or the induced-max
+            # template didn't land the perf-state table) is INCONCLUSIVE,
+            # not a regression — never fail the gate or touch the baseline
+            # on it, or thermal noise would spuriously fail CI and a slow
+            # sample could poison the ratchet high.
+            note = (note + "; " if note else "") + "inconclusive (clock != Maximum)"
+            warn(f"{tuple(r['shape'])}: clock {clock!r}, not Maximum — skipping gate")
+        else:
+            key = _metal_baseline_key(r)
+            prev = baseline.get(key)
+            if refresh or prev is None:
+                if prev is None and not refresh:
+                    note = (note + "; " if note else "") + "baseline established"
+                baseline[key] = us
+                baseline_dirty = True
+            elif us > prev * _METAL_GATE_TOLERANCE:
+                Gate.fail(
+                    f"metal kernel regression on {tuple(r['shape'])}: "
+                    f"{us:.2f} us vs baseline {prev:.2f} us "
+                    f"(>{(_METAL_GATE_TOLERANCE - 1) * 100:.0f}% over; "
+                    f"--refresh-baseline to accept)"
+                )
+            elif us < prev:
+                baseline[key] = us  # ratchet down
+                baseline_dirty = True
+
         print(
             f"  {str(tuple(r['shape'])):>18} | {us:10.2f} | {clock:>8} | "
             f"{duty:6.1f} | {note}"
         )
     print("  " + "-" * 70)
     print("  absolute GPU time (mojo-only; upstream is CUDA-only — nothing to diff)")
+    if baseline_dirty:
+        _METAL_BASELINE.parent.mkdir(parents=True, exist_ok=True)
+        _METAL_BASELINE.write_text(json.dumps(baseline, indent=1, sort_keys=True))
+        print(f"  (baseline updated: {_METAL_BASELINE.relative_to(REPO)})")
+    _print_roofline(rows)
 
 
 # --------------------------------------------------------------------------
@@ -955,16 +1098,55 @@ def assembly(be: Backend, fn, dtype, canon, refresh_reference) -> None:
     elif be.name == "rocm":
         _assembly_dump_only(be, fn, dtype, canon)
     elif be.name == "metal":
-        # compile_function's dump_asm (our DUMP_ASSEMBLY_INTO) emits textual
-        # ISA only for PTX / AMDGPU targets; Metal lowers straight to a
-        # metallib with no textual ISA dump, so there is nothing to write
-        # (and occupancy is GUI-only).
-        skip(
-            "(e/f/g) GPU asm",
-            "Mojo emits no textual Metal ISA (metallib only); occupancy is GUI-only",
-        )
+        _assembly_metal(fn)
     else:  # cpu
         skip("(e/f/g) GPU asm", "CPU build emits no GPU device code")
+
+
+def _assembly_metal(fn) -> None:
+    """Metal has no textual native ISA (Mojo emits a metallib, and Apple
+    ships no g16 instruction printer), but we can still introspect the
+    kernel headlessly via scripts/_metal_introspect.py: static pipeline
+    facts + an AIR instruction-mix histogram (the Apple analog of the
+    NVIDIA PTX histogram) + native AGX code size. The just-run bench left
+    the kernel's metallib in ~/.cache/modular for the tool to find."""
+    section("(e/f/g) Metal kernel introspection (static facts + AIR mix)")
+    r = run(
+        [sys.executable, str(REPO / "scripts" / "_metal_introspect.py"),
+         "--fn", fn, "--json"],
+        capture=True,
+    )
+    line = (r.stdout or "").strip().splitlines()
+    if r.returncode != 0 or not line:
+        if r.stderr:
+            sys.stderr.write(r.stderr)
+        warn("metal introspection unavailable")
+        return
+    try:
+        rep = json.loads(line[-1])
+    except json.JSONDecodeError:
+        warn("metal introspection produced no JSON")
+        return
+    s = rep.get("static", {})
+    if "function" in s:
+        print(
+            f"  threadgroup mem: {s['threadgroup_memory_bytes']} B | "
+            f"SIMD width: {s['simd_width']} | "
+            f"max threads/tg: {s['max_threads_per_threadgroup']}"
+        )
+    agx = rep.get("agx", {})
+    if agx.get("slice"):
+        print(f"  native code: {agx['code_bytes']} B ({agx['slice']})")
+    hist = rep.get("air_histogram", {})
+    if hist and "error" not in hist:
+        top = sorted(hist.items(), key=lambda kv: -kv[1])[:10]
+        print("  AIR instruction mix (top 10, pre-regalloc — analog of PTX):")
+        for op, c in top:
+            print(f"    {c:5d}  {op}")
+    print(
+        "  (HW occupancy / ALU% / stalls are GUI-only on Apple; not shown — "
+        "see _metal_introspect.py header)"
+    )
 
 
 def _dump_ptx(be: Backend, fn, dtype, canon, asm_dir: Path) -> Path | None:
@@ -1262,6 +1444,7 @@ def main() -> int:
 
         signal.signal(signal.SIGTERM, _on_signal)
         signal.signal(signal.SIGHUP, _on_signal)
+    agent_rows: list[dict] = []
     try:
         # (b) correctness is tier-based and covers every function family.
         if args.skip_correctness:
@@ -1273,18 +1456,58 @@ def main() -> int:
             shapes = [sh["canon"]] if tier == "quick" else sh["full"]
             if len(fns) > 1:
                 section(f"### function: {fn} ###")
-            reps = bench_kernel(be, fn, dtype, shapes, runs, clock, baseline_flags)
+            # Metal kernel-time runs are whole xctrace recordings (~30 s
+            # each), not cheap in-process loops, and their medians scatter
+            # <1% under the locked clock — one recording is plenty for the
+            # quick tier's 10%-tolerance gate. FULL takes 3 for real
+            # cross-recording spread. (_bench.py now honors --runs
+            # literally on metal: N recordings.)
+            kruns = runs if be.name != "metal" else (3 if tier == "full" else 1)
+            reps = bench_kernel(
+                be,
+                fn,
+                dtype,
+                shapes,
+                kruns,
+                clock,
+                baseline_flags,
+                metal_refresh=args.refresh_baseline,
+            )
+            agent_rows.extend(_agent_row(r) for r in reps)
             profiler(be, fn, dtype, sh["canon"], args.skip_ncu, reps)
             if not args.skip_asm:
                 assembly(be, fn, dtype, sh["canon"], args.refresh_reference)
             else:
                 skip("(e/f/g) assembly", "--skip-asm")
-            walltime(be, fn, dtype, sh["canon"], runs, clock, baseline_flags)
+            # On metal the "lock" is a patched xctrace template — it only
+            # applies to recordings, so the walltime run (no xctrace)
+            # executes at ambient clocks. Tag it honestly: the tag feeds
+            # _bench.py's baseline cache key, and claiming
+            # `induced-maximum` there would file unlocked numbers under a
+            # locked-clock environment.
+            wt_clock = "unlocked" if be.name == "metal" else clock
+            walltime(be, fn, dtype, sh["canon"], runs, wt_clock, baseline_flags)
     finally:
         if locked:
             unlock_clocks(be)
 
     section("summary")
+    # Machine-readable block for an agent driving a perf loop: one JSON
+    # object with per-shape kernel time + roofline verdict + regime/hint,
+    # delimited so it can be sliced out of the full log without scraping
+    # the human tables. Kept compact and stable-keyed.
+    if agent_rows:
+        summary = {
+            "backend": be.name,
+            "device": be.pretty,
+            "tier": tier,
+            "dtype": dtype,
+            "gate": "fail" if Gate.failed else "pass",
+            "shapes": agent_rows,
+        }
+        print("===AGENT-SUMMARY===")
+        print(json.dumps(summary))
+        print("===END-AGENT-SUMMARY===")
     if Gate.failed:
         print(f"ISSUES — one or more gates failed above (fn={args.fn} tier={tier})")
         return 1

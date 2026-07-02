@@ -24,12 +24,13 @@ pattern from `update/` and `bwd_full/`.
 
 from std.gpu.host import DeviceContext
 from std.gpu.host.device_context import _DeviceContextPtr, _DeviceContextCpp
+from std.math import ceildiv
 from std.memory import OpaquePointer
 from layout import TileTensor, Idx, TensorLayout
 from layout.tile_layout import Layout
 
-from kernel import fwd_kernel
-from common import kNThreads
+from kernel import fwd_kernel, fwd_channellast_kernel
+from common import kNThreads, kNThreadsCL, kChunkLCL, kNEltsFwd
 
 
 def launch_fwd[
@@ -42,6 +43,7 @@ def launch_fwd[
     contig_inner: Bool,
     aligned_seq: Bool,
     vec_aligned: Bool,
+    channel_last: Bool,
     use_external_stream: Bool,
     dump_assembly_into: StaticString = "",
 ](
@@ -111,6 +113,87 @@ def launch_fwd[
     var o_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
         unsafe_from_address=o_addr
     )
+
+    # Channel-last fast path: dim is the contiguous axis of x/out, so a
+    # dedicated no-smem kernel walks seqlen with the halo in registers
+    # (see fwd_channellast_kernel). Raw pointers + dynamic strides — the
+    # TileTensor plumbing below is bypassed entirely. `channel_last` is
+    # comptime, so the generic path's code is dead in these variants.
+    comptime if channel_last:
+        var compiled_cl = ctx.compile_function[
+            fwd_channellast_kernel[
+                dtype,
+                width,
+                has_bias,
+                has_initial_states,
+                apply_silu,
+            ],
+            dump_asm=dump_assembly_into,
+        ]()
+        # Seqlen rows per block: 64 when the grid is already wide, halved
+        # down to 8 while the total block count sits under ~512 (small
+        # shapes are latency-bound — more, shorter blocks beat the halo
+        # re-read cost of (W-1)/rows extra x traffic).
+        var n_chunks_c = ceildiv(dim_int, kNThreadsCL * kNEltsFwd[dtype]())
+        var rows_per_block = kChunkLCL
+        while (
+            rows_per_block > 8
+            and batch_int * n_chunks_c * ceildiv(seqlen_int, rows_per_block)
+            < 512
+        ):
+            rows_per_block //= 2
+        var grid_cl = (
+            batch_int,
+            ceildiv(seqlen_int, rows_per_block),
+            n_chunks_c,
+        )
+        comptime if use_external_stream:
+            var stream_cl = ctx.create_external_stream(stream_opaque)
+            stream_cl.enqueue_function(
+                compiled_cl,
+                seqlen_int,
+                dim_int,
+                rows_per_block,
+                x_ptr,
+                w_ptr,
+                b_ptr,
+                initial_states_ptr,
+                o_ptr,
+                x_b_stride,
+                x_l_stride,
+                w_c_stride,
+                o_b_stride,
+                o_l_stride,
+                initial_states_b_stride,
+                initial_states_c_stride,
+                initial_states_l_stride,
+                grid_dim=grid_cl,
+                block_dim=(kNThreadsCL,),
+            )
+        else:
+            ctx.enqueue_function(
+                compiled_cl,
+                seqlen_int,
+                dim_int,
+                rows_per_block,
+                x_ptr,
+                w_ptr,
+                b_ptr,
+                initial_states_ptr,
+                o_ptr,
+                x_b_stride,
+                x_l_stride,
+                w_c_stride,
+                o_b_stride,
+                o_l_stride,
+                initial_states_b_stride,
+                initial_states_c_stride,
+                initial_states_l_stride,
+                grid_dim=grid_cl,
+                block_dim=(kNThreadsCL,),
+            )
+            ctx.synchronize()
+        return
 
     # The `contig_inner` fast path bakes `Idx[1]` into the inner stride
     # slot of each Layout, so the multiply on the innermost stride folds

@@ -11,6 +11,12 @@ from std.sys import size_of
 # Shared by the GPU forward kernel + the GPU launcher (grid math).
 comptime kNThreads: Int = 128
 
+# Channel-last forward kernel: threads per block, and how many seqlen
+# rows one block walks. A block covers kNThreadsCL * kNElts consecutive
+# channels (512 for fp16/bf16, 256 for fp32) x kChunkLCL seqlen rows.
+comptime kNThreadsCL: Int = 64
+comptime kChunkLCL: Int = 64
+
 
 # Per-thread element count for the forward kernel: 16 bytes per thread per
 # load. This is `8` for fp16/bf16 (16 / 2) and `4` for fp32 (16 / 4). Picking
