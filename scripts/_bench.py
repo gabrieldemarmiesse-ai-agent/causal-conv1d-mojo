@@ -834,8 +834,16 @@ def _record_trace(child_argv: list[str], trace: str, *, attempts: int = 6) -> No
     deterministic, so retry until the intervals table actually exports back.
     The traced child inherits `_TRACED_ENV=1` so it runs the bare workload
     loop instead of recursively orchestrating another trace.
+
+    Heap revival (`_mps.revive_heaps`) is disabled in the child: its tiny
+    torch touch kernels would land in the same unlabeled Compute group as
+    the conv kernel and pollute the per-encoder stats. This is
+    measurement-safe — a busy dispatch loop keeps the GPU from idling, and
+    idle-eviction (the thing revival guards against) only strikes after
+    ~1 s of device inactivity; verified by a 3 s revival-off update loop
+    (60k calls) whose final output still matched the reference exactly.
     """
-    env = {**os.environ, _TRACED_ENV: "1"}
+    env = {**os.environ, _TRACED_ENV: "1", "CAUSAL_CONV1D_MPS_REVIVE": "off"}
     for attempt in range(1, attempts + 1):
         if os.path.exists(trace):
             shutil.rmtree(trace, ignore_errors=True)
@@ -893,13 +901,24 @@ def _pick_headline(groups: list[dict]) -> dict | None:
 
 
 def _summarize_trace(
-    trace: str, *, process: str = "python"
+    trace: str, *, process: str = "python", expected_iters: int | None = None
 ) -> tuple[dict, list[float]]:
     """Parse the trace into a structured Instruments analysis.
 
     Returns (analysis_dict, headline_durs_us) where the analysis lists every
     GPU encoder grouped by (channel, label, clock) and headline_durs_us is
     the per-interval µs list for the conv kernel (for min/spread reporting).
+
+    ``expected_iters`` guards the headline against foreign-encoder
+    contamination: Mojo doesn't label its Metal encoders, so torch's own
+    compute dispatches inside the traced region (autograd bookkeeping for
+    the bwd callable, dtype casts, the _mps heap-revival touches, ...)
+    land in the *same* unlabeled Compute group as our kernel. Those
+    encoders are tiny next to the conv kernel, so when the headline group
+    holds more intervals than the loop ran iterations we keep only the
+    ``expected_iters`` largest durations — otherwise a single 3 µs torch
+    encoder becomes the reported "kernel min". The number of discarded
+    intervals is surfaced as ``headline_excluded``.
     """
     windows = _load_clock_timeline(trace)
     bucket: dict[tuple[str, str, str], list[int]] = defaultdict(list)
@@ -935,9 +954,25 @@ def _summarize_trace(
 
     headline = _pick_headline(groups)
     headline_durs = []
+    headline_excluded = 0
     if headline is not None:
         key = (headline["channel"], headline["label"], headline["clock"])
-        headline_durs = [d / 1e3 for d in headline_by_key[key]]
+        durs = sorted(headline_by_key[key], reverse=True)
+        if expected_iters is not None and 0 < expected_iters < len(durs):
+            headline_excluded = len(durs) - expected_iters
+            durs = durs[:expected_iters]
+            # Re-derive the headline's stats from the filtered set so the
+            # printed number and Measurement agree (the raw, contaminated
+            # group row stays visible in the groups table above).
+            headline = {
+                **headline,
+                "count": len(durs),
+                "median_us": statistics.median(durs) / 1e3,
+                "min_us": min(durs) / 1e3,
+                "max_us": max(durs) / 1e3,
+                "total_us": sum(durs) / 1e3,
+            }
+        headline_durs = [d / 1e3 for d in durs]
 
     analysis = {
         "trace": trace,
@@ -945,6 +980,7 @@ def _summarize_trace(
         "clock_windows": bool(windows),
         "groups": groups,
         "headline": headline,
+        "headline_excluded": headline_excluded,
         "intervals": n,
         "total_gpu_ms": grand_ns / 1e6,
         "duty": _gpu_duty_cycle(trace),
@@ -987,7 +1023,7 @@ def run_metal_kernel(cfg: Config, args, env_sig: dict, tag: str) -> dict:
     _record_trace(child, trace)
 
     # 3) Read per-encoder GPU intervals back out.
-    analysis, headline_durs = _summarize_trace(trace)
+    analysis, headline_durs = _summarize_trace(trace, expected_iters=args.iters)
     m = Measurement(runs_us=headline_durs)
     if not headline_durs:
         m.error = "no Compute GPU intervals found in trace"
@@ -1238,6 +1274,12 @@ def _print_metal_analysis(a: dict) -> None:
             f"    headline kernel time (Compute Command @ {h['clock']} clock, "
             f"median): {h['median_us']:.2f} us  (count={h['count']})"
         )
+        if a.get("headline_excluded"):
+            print(
+                f"    ({a['headline_excluded']} extra encoder interval(s) in the "
+                f"group excluded as foreign — torch casts/autograd/revival "
+                f"touches share the unlabeled Compute Command group)"
+            )
         if a["clock_windows"] and h["clock"] != "Maximum":
             print(
                 f"    WARNING: GPU never reached Maximum clock (best observed: "
