@@ -1,16 +1,24 @@
-"""Pure-Mojo (no Python, no PyTorch) repro of a GPU-dispatch correctness
-bug on Apple Metal: a Mojo kernel launched against a *foreign* MTLBuffer
-(one Mojo's DeviceContext never allocated itself) reads/writes zero
-instead of the real data, whenever that buffer has
-MTLResourceHazardTrackingModeUntracked set — the same option ML
-frameworks like PyTorch commonly use for their own GPU allocators to
-bypass Metal's automatic hazard tracking.
+"""Pure-Mojo (no Python, no PyTorch) repro, variant 2 of 2: a Mojo kernel
+launched against a foreign *device-allocated* MTLBuffer with
+MTLResourceHazardTrackingModeUntracked reads/writes zero, 100%
+deterministically, on any cache state.
 
-Unlike the PyTorch-interop repro (repro.py) — which only fails on the
-very first dispatch after a cold `~/.cache/modular` cache, then
-self-heals — this fails 100% deterministically, on every call, on any
-cache state. Toggle `kUntrackedShared` to 0 (tracked/default) below to
-see the same buffer + same kernel dispatch always succeed instead.
+This is a sibling manifestation of the same root cause as
+`repro_heap.mojo` (which matches the real PyTorch-interop case — go read
+that one first): Mojo's Metal backend only emits
+[encoder useResource:usage:] for buffers found in its own internal
+allocation table, so foreign buffers referenced by raw gpuAddress are
+never declared to the encoder. Empirically on macOS 26 / M4:
+
+  - foreign device-allocated buffer, TRACKED   -> always works (the
+    driver appears to keep plain device allocations resident)
+  - foreign device-allocated buffer, UNTRACKED -> always fails (this file)
+  - foreign HEAP sub-allocation, TRACKED       -> works only within ~1s
+    of the last GPU work touching that heap (repro_heap.mojo; this is
+    what PyTorch MPS tensors are)
+
+Toggle `kUntrackedShared` to 0 (tracked/default) below to see the same
+dispatch always succeed instead.
 
     uv run mojo run repro_pure.mojo
 """

@@ -1,160 +1,163 @@
-# Mojo GPU kernel reads/writes zero on Apple Metal for buffers it didn't allocate
+# Mojo/Metal: kernels silently read/write zero for foreign GPU buffers — `useResource:` is only emitted for Mojo's own allocations
 
 ## Summary
 
-A Mojo kernel launched via `DeviceContext.enqueue_function` against a
-GPU buffer it did not allocate itself (reconstructed from a raw address
-via `UnsafePointer(unsafe_from_address=...)`) can silently read/write
-zero instead of the real data, on Apple Metal.
+On Apple Metal, a Mojo kernel launched via `DeviceContext.enqueue_function`
+against a GPU buffer that Mojo did not allocate itself (referenced by raw
+address via `UnsafePointer(unsafe_from_address=...)`) silently reads zeros
+from it and/or drops writes to it, with no error anywhere — whenever the
+Metal driver does not happen to have that allocation resident.
 
-We have two repros:
+**Root cause** (confirmed by disassembling `libAsyncRTMojoBindings.dylib`,
+see "Evidence 4"): `MetalDeviceContext::enqueueFunctionExecDirect` calls
+`[MTLComputeCommandEncoder useResource:usage:]` **only for addresses found
+in Mojo's internal allocation-tracking table**, which is populated only by
+Mojo's own buffer allocator. Foreign buffers are never declared to the
+encoder, so their residency is left to chance:
 
-1. **`repro.py`** — the real-world case: a PyTorch MPS tensor's GPU
-   address is extracted (via the same `gpuAddress` Objective-C selector
-   Mojo itself uses internally) and handed to a Mojo kernel. This fails
-   deterministically on the *first* kernel dispatch after a cold
-   `~/.cache/modular` cache, then **self-heals** — a second call in the
-   same process, or any call once the cache is warm, succeeds.
-2. **`repro_pure.mojo`** — a from-scratch, dependency-free isolation: a
-   raw `MTLBuffer` allocated directly via Objective-C
-   (`newBufferWithLength:options:`) with
-   `MTLResourceHazardTrackingModeUntracked` set, then handed to a Mojo
-   kernel the same way. This fails **100% of the time**, independent of
-   cache state or repeated calls — flip the one `options` bit back to
-   the default (hazard-tracked) and it always succeeds instead.
+| foreign buffer kind                          | result                                    |
+|----------------------------------------------|-------------------------------------------|
+| device-allocated, hazard-**tracked**          | works (driver keeps it resident, empirically even after 15 s idle) |
+| device-allocated, hazard-**untracked**        | **always fails** (`repro_pure.mojo`)       |
+| **MTLHeap sub-allocation**, hazard-tracked    | works only within **~1–1.5 s** of the last GPU work that touched that heap; fails after (`repro_heap.mojo`) |
 
-We believe (1) and (2) are related but have not been able to fully
-unify them into one root cause — see "Open question" below.
+The third row is the one that bites real interop code: **PyTorch's MPS
+allocator sub-allocates every tensor from hazard-tracked shared `MTLHeap`s**
+(verified on-device and in `MPSAllocator.mm` — pools built with
+`UsageFlags::HAZARD`, bound by torch itself via `setBuffer:` so torch never
+needs `useResource:`). macOS evicts idle GPU memory after roughly a second
+(independently documented in ggml-org/llama.cpp#10119, fixed there with
+`MTLResidencySet`, llama.cpp PR #11427), after which the undeclared heap's
+`gpuAddress` silently reads as zeros and writes to it are dropped.
+
+## The red herring we chased first
+
+The bug originally presented as: *"the first kernel dispatch after
+`mojo --clear-cache -f` returns all-zero output, then self-heals."* That
+framing is wrong — the cache is only a **delay amplifier**:
+
+- cold-cache `mojo build`: several seconds between torch's last GPU work
+  and the dispatch → heap evicted → **always fails**;
+- warm-cache build: ~1.2 s → borderline inside the window → passes;
+- second call in-process: ~0 s gap → passes ("self-healing");
+- **any** ≥1.5 s GPU-idle gap reproduces it with a fully warm cache and a
+  prebuilt `.so` — e.g. `time.sleep(2)` before the dispatch, or think-time
+  between decode steps in an interactive workload. Sub-second gaps never do.
+
+We bisected the threshold on this machine to between 1.0 s (passes) and
+1.5 s (fails), matching the llama.cpp report of macOS's ~1 s idle eviction.
 
 ## Environment
 
-- Hardware: Mac mini (Mac16,10), Apple M4, 16 GB
-- OS: macOS 26.3.2 (build 25D2140)
-- Mojo: `1.0.0b3.dev2026062306` (`b65c36ac`)
-- PyTorch: `2.8.0` (only used by `repro.py`; `repro_pure.mojo` has zero
-  Python/PyTorch dependency)
-- Backend: Metal (`mps`)
+- Mac mini (Mac16,10), Apple M4, 16 GB, macOS 26.3.2 (25D2140)
+- Mojo `1.0.0b3.dev2026062306` (`b65c36ac`), Metal backend
+- PyTorch 2.8.0 (only for `repro.py`/`workaround.py`; the `.mojo` repros
+  have zero Python/PyTorch dependency)
 
-## Repro 1: PyTorch MPS interop (`repro.py`), flaky / self-healing
+## Repros (all in this branch, `mojo-cold-cache-bug-repro`)
 
-```bash
-git clone <this repo>
-cd causal-conv1d-mojo
-git checkout mojo-cold-cache-bug-repro
-uv sync
-uv run mojo --clear-cache -f     # clear Mojo's own toolchain cache
-uv run python repro.py
+1. **`repro_heap.mojo` — pure Mojo, deterministic, matches the real-world
+   case.** Allocates a hazard-tracked shared `MTLHeap` via Obj-C FFI
+   (exactly PyTorch's configuration), sub-allocates two tiny buffers,
+   touches the heap with a blit on a separate queue (playing PyTorch's
+   role), sleeps 2 s, then dispatches a one-thread copy kernel against the
+   raw `gpuAddress`es. `uv run mojo run repro_heap.mojo` → the sentinel in
+   the output buffer is untouched: the dispatch did nothing. Toggles in
+   the file demonstrate the full behavior matrix (no-touch → fails even
+   without sleeping; touch + no sleep → passes).
+2. **`repro_pure.mojo` — pure Mojo, deterministic, sibling case.** Same
+   dispatch against a *device-allocated* buffer with
+   `MTLResourceHazardTrackingModeUntracked` (no heap, no sleep needed):
+   always fails; flip one bit to hazard-tracked and it always passes.
+3. **`repro.py` — the original PyTorch-interop manifestation.**
+   `mojo --clear-cache -f && uv run python repro.py` → all-zero output.
+   The git history of this branch documents the step-by-step trimming from
+   a real `causal_conv1d_update` kernel down to this ~25-line script, each
+   step verified to still reproduce.
+4. **`workaround.py`** — same flow as `repro.py` plus the mitigation below;
+   passes even on a cold cache with an extra 2 s sleep.
+
+## Evidence
+
+1. **The dispatch is truly lost, not a stale view**: prefilling the output
+   tensor with a sentinel (99) shows it untouched after the "failed"
+   dispatch, read back both through torch and directly through the
+   `MTLBuffer`'s `contents` pointer.
+2. **Per-heap independence / third failure mode**: with the input tensor on
+   an idle large-pool heap and the output tensor on a freshly-revived
+   small-pool heap, the kernel *runs* — the write lands, but the read
+   returns zeros (output becomes 0.0 instead of staying 99). Reads and
+   writes fail independently per undeclared heap.
+3. **Ground truth on PyTorch buffers** (Obj-C introspection on-device):
+   every MPS tensor's `MTLBuffer` reports `hazardTrackingMode=2 (Tracked)`,
+   `storageMode=0 (Shared)`, `[buffer heap] != nil`
+   (`AGXG16GFamilyHeap`, 8 MiB small pool / 32 MiB large pool), on the
+   same `MTLDevice` object as `MTLCreateSystemDefaultDevice()`.
+4. **Disassembly of `libAsyncRTMojoBindings.dylib`** (the only dylib in the
+   Mojo distribution linking Metal.framework; contains the source path
+   string `MLRT/lib/Driver/DeviceContext/Metal/MetalDeviceContext.cpp`):
+   of the 221 real `objc_msgSend` call sites in the binary, 203 were
+   resolved to concrete selectors. Exactly **two** call
+   `useResource:usage:`, both inside `enqueueFunctionExecDirect`, and both
+   are gated behind a lookup of the argument's GPU address in a
+   mutex-protected, address-range-indexed internal allocation table —
+   entries exist only for Mojo-created buffers, and the matched entry's
+   `id<MTLBuffer>` is what gets declared. No call sites exist for
+   `useHeap:`, `useResidencySet:`, `addResidencySet:` or any
+   `MTLResidencySet` machinery (those selectors appear only in a generated
+   catch-all selector catalog). Kernel arguments are bound with
+   `setBuffer:offset:atIndex:` in a loop; the dispatch is the classic
+   `dispatchThreadgroups:threadsPerThreadgroup:` + `commit` +
+   `waitUntilCompleted` sequence with no fences/events.
+5. **Silent failure**: `MTL_DEBUG_LAYER=1` (API validation) reports nothing
+   for the lost dispatch. There is no command-buffer error. (Aside:
+   `MTL_SHADER_VALIDATION=1` breaks Mojo's runtime pipeline creation
+   entirely — `Failed to create compute pipeline state ... XPC_ERROR_
+   CONNECTION_INTERRUPTED` — which is its own minor issue and prevented us
+   from using shader validation to observe the bad access directly.)
+
+## Workaround (validated, in `workaround.py`)
+
+Immediately before every Mojo dispatch, issue a tiny GPU op touching
+**each** argument tensor, then synchronize:
+
+```python
+for t in (x, out):            # every tensor argument, not just one:
+    t.view(-1)[0:1].add_(0)   # heaps are revived individually
+torch.mps.synchronize()
+variant_fn(gpu_address(x), gpu_address(out))
 ```
 
-Expected: prints a nonzero output. Actual: prints `tensor([0.])` and the
-script's own assertion fails, on a cold cache. Run it again (or run it
-twice in the same process — see `/tmp`-style variant below) and it
-passes.
+This puts the dispatch back inside the driver's residency window. Costs a
+couple of tiny kernel launches (~tens of µs). A bare
+`torch.mps.synchronize()` is NOT sufficient (an empty queue submits
+nothing); the touch must be real GPU work. For tensors requiring grad, use
+a read-only touch (`t.view(-1)[0:1].clone()`) to avoid the autograd
+version-counter bump.
 
-The whole call chain (`src/causal_conv1d_mojo/`) is trimmed to ~150
-lines total across `__init__.py`, `kernel.mojo`, and `variant.mojo` —
-see the file headers for how the GPU address is extracted from a torch
-tensor and handed to the kernel. The kernel itself is a single-thread,
-single-element copy (`o_ptr[0] = x_ptr[0]`); the bug reproduces
-regardless of what the kernel actually computes.
+## Suggested fixes on the Mojo side
 
-Every commit on this branch is a verified-still-reproducing trim step,
-if you want to see the full derivation from the original, much larger
-`causal_conv1d_update` kernel down to this minimal form.
+Any of, in increasing order of niceness:
 
-## Repro 2: pure Mojo, deterministic (`repro_pure.mojo`)
+1. Document loudly that `unsafe_from_address` pointers into GPU memory not
+   allocated by the `DeviceContext` are not supported on Metal (they
+   *appear* to work, which is the trap).
+2. Provide an API to import/register an external `MTLBuffer` (or address
+   range) with the `DeviceContext`, inserting it into the existing
+   allocation-tracking table so the already-present `useResource:` path
+   covers it.
+3. Attach an `MTLResidencySet` to the command queue covering all argument
+   address ranges the runtime cannot resolve — or simply follow llama.cpp
+   (PR #11427) in using residency sets wholesale.
+
+## Reproduction quickstart
 
 ```bash
-uv run mojo run repro_pure.mojo
+git checkout mojo-cold-cache-bug-repro && uv sync
+
+uv run mojo run repro_heap.mojo        # pure Mojo, deterministic  -> FAIL
+uv run mojo run repro_pure.mojo        # pure Mojo, untracked case -> FAIL
+uv run mojo --clear-cache -f
+uv run python repro.py                 # PyTorch manifestation     -> FAIL
+uv run python workaround.py            # mitigation                -> PASS
 ```
-
-No PyTorch, no Python, no `mojo build`/cache interaction at all beyond
-what `mojo run` itself does. The program:
-
-1. Calls `MTLCreateSystemDefaultDevice()` and `newBufferWithLength:2
-   options:256` directly via `objc_msgSend` (256 =
-   `MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked`)
-   to allocate two 1-element fp16 buffers — entirely outside of Mojo's
-   own `DeviceContext.enqueue_create_buffer` allocator.
-2. Writes a known value (42.0) into the input buffer via its Metal
-   `contents` pointer.
-3. Extracts each buffer's `gpuAddress` and wraps it in an
-   `UnsafePointer(unsafe_from_address=...)`.
-4. Creates a Mojo `DeviceContext()`, compiles a trivial one-thread copy
-   kernel, and dispatches it against those two pointers.
-5. Reads the output buffer back via its `contents` pointer.
-
-Result: **always** prints `out: 0.0` — the copy silently did nothing.
-Change `kUntrackedShared` from `256` to `0` (dropping
-`MTLResourceHazardTrackingModeUntracked`) and the same kernel, same
-dispatch code, same buffers-not-owned-by-DeviceContext setup **always**
-prints `out: 42.0` instead. We ran each configuration 3+ times, with
-and without clearing `~/.cache/modular`, and across fresh processes and
-repeated in-process dispatches — the tracked/untracked bit is the only
-variable that changes the outcome, 100% of the time in both directions.
-
-## Analysis
-
-`MTLResourceHazardTrackingModeUntracked` tells Metal the *application*
-is responsible for any synchronization/visibility guarantees around
-that buffer — normally via `[MTLComputeCommandEncoder useResource:
-usage:]` (or a residency set) before encoding a dispatch that touches
-it. ML frameworks commonly allocate their tensor storage with this flag
-for performance (we have not directly confirmed PyTorch's MPS allocator
-does this, but it is standard practice and consistent with what we
-observe).
-
-Our reading is that `DeviceContext.enqueue_function` does not call
-`useResource:` (or add the buffer to a residency set) for pointer
-arguments that were never obtained through Mojo's own buffer allocator
-(i.e. arguments constructed via `unsafe_from_address` rather than a
-`DeviceBuffer` handle). For a hazard-tracked buffer this is harmless —
-Metal's automatic tracking covers it regardless of how Mojo refers to
-it. For a hazard-*un*tracked buffer, nothing declares the dependency to
-the GPU, and the dispatch can execute without the correct
-read/write visibility, observed here as the kernel appearing to do
-nothing (reads/writes zero).
-
-## Open question: does this explain the flaky PyTorch case?
-
-We could not fully reconcile the two repros' behavior:
-
-- Repro 2 (pure Mojo, untracked hazard buffer) fails **every time**,
-  regardless of cache state or how many times the same kernel is
-  dispatched in the same process.
-- Repro 1 (PyTorch interop) fails only on the **first** dispatch after
-  a cold `~/.cache/modular`, then **self-heals** on any subsequent
-  call — even though each call in `repro.py` creates a brand-new
-  `DeviceContext()` and a freshly-recompiled `.so` (we deliberately
-  removed all caching/reuse of the Mojo context and compiled artifact
-  across calls while trimming this repro, and the self-healing
-  behavior persisted regardless).
-
-We verified the self-healing behavior holds even with that caching
-removed, which rules out "Mojo reuses the same compiled kernel/context
-object" as the explanation. Our best guess is that Mojo's own toolchain
-cache (`~/.cache/modular/.mojo_cache`) being warm changes how fast/how
-`mojo build` re-compiles the *same* kernel source, and that in turn
-affects something downstream at the Metal driver level (e.g. Apple's
-own system-level shader compilation cache, or GPU clock/wake state) —
-a timing-sensitive interaction layered on top of the same
-untracked-hazard-buffer gap identified in Repro 2. We were not able to
-fully verify this within pure Mojo, since Repro 2 does not depend on
-`mojo build`/caching at all (it's a single `mojo run` invocation).
-
-We think Repro 2 stands on its own as a clear, deterministic bug
-(`DeviceContext.enqueue_function` does not establish Metal residency
-for hazard-untracked foreign buffers), and Repro 1 is very likely the
-same underlying gap manifesting through PyTorch's real allocator, with
-an additional cache/timing factor we have not fully isolated.
-
-## Files
-
-- `repro.py` — PyTorch MPS interop repro (flaky/self-healing)
-- `repro_pure.mojo` — pure-Mojo deterministic repro
-- `src/causal_conv1d_mojo/` — the trimmed-down Python/Mojo glue used by
-  `repro.py` (`__init__.py`, `kernel.mojo`, `variant.mojo`)
-- Git history on this branch (`mojo-cold-cache-bug-repro`) documents
-  every trimming step from the original, much larger
-  `causal_conv1d_update` kernel down to this minimal form, each
-  verified to still reproduce the bug before moving to the next.
