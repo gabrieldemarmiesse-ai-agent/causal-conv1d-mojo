@@ -85,6 +85,38 @@ def _config_from_args(args: tuple) -> tuple:
     # passes 0). Can't be derived from `stream_handle_addr` itself
     # because torch's default CUDA stream has cuda_stream == 0.
     use_external_stream = bool(args[29])
+    # Channel-last fast path (Metal only for now — correct but untested
+    # on NVIDIA/AMD hardware, where the generic strided path keeps
+    # handling this layout): x/out have dim contiguous (stride(1)==1)
+    # and seqlen strided — the layout a (B, L, D)-contiguous activation
+    # gets after .transpose(1, 2), i.e. upstream's `is_channel_last`
+    # condition. The dedicated kernel vectorizes along dim, so dim and
+    # the non-contiguous strides of x/out must all be multiples of
+    # kNElts to keep every 16-byte access aligned. seq_idx stays on the
+    # generic path (v1 scope; mirrors it being the rarer case here —
+    # note upstream is the opposite: their seq_idx REQUIRES
+    # channel-last).
+    kn = _KN_ELTS[dtype_code]
+    channel_last = (
+        not use_external_stream
+        and args[8] == 1  # x dim-contiguous
+        and args[9] > 1  # x seqlen strided (else the contig path wins)
+        and args[13] == 1  # out dim-contiguous
+        and args[14] > 1
+        and args[11] == 1  # weight width-contiguous
+        and not has_seq_idx
+        and args[5] % kn == 0  # dim
+        and args[7] % kn == 0  # x batch stride
+        and args[9] % kn == 0  # x seqlen stride
+        and args[12] % kn == 0  # out batch stride
+        and args[14] % kn == 0  # out seqlen stride
+    )
+    if channel_last:
+        # These three only parameterize the generic kernel; pin them so
+        # every channel-last shape shares one cached variant.
+        contig_inner = False
+        aligned_seq = False
+        vec_aligned = False
     return (
         dtype_code,
         width,
@@ -95,6 +127,7 @@ def _config_from_args(args: tuple) -> tuple:
         contig_inner,
         aligned_seq,
         vec_aligned,
+        channel_last,
         use_external_stream,
     )
 
@@ -105,11 +138,12 @@ def _mod_name(config: tuple) -> str:
     Used as the cache key. Reading it should be enough to reproduce
     the config by hand.
     """
-    (dt, w, hb, hs, hi, silu, c, a, va, ues) = config
+    (dt, w, hb, hs, hi, silu, c, a, va, cl, ues) = config
     return (
         f"{_DTYPE_NAME[dt]}_w{w}"
         f"_hb{int(hb)}_hs{int(hs)}_hi{int(hi)}_silu{int(silu)}"
-        f"_contig{int(c)}_aligned{int(a)}_vec{int(va)}_extstr{int(ues)}"
+        f"_contig{int(c)}_aligned{int(a)}_vec{int(va)}_cl{int(cl)}"
+        f"_extstr{int(ues)}"
     )
 
 
@@ -118,7 +152,7 @@ def _defines(config: tuple) -> dict[str, str]:
 
     The corresponding `comptime` reads live in `fwd/variant.mojo`.
     """
-    (dt, w, hb, hs, hi, silu, c, a, va, ues) = config
+    (dt, w, hb, hs, hi, silu, c, a, va, cl, ues) = config
 
     def b(x: bool) -> str:
         return "true" if x else "false"
@@ -133,6 +167,7 @@ def _defines(config: tuple) -> dict[str, str]:
         "CONTIG_INNER": b(c),
         "ALIGNED_SEQ": b(a),
         "VEC_ALIGNED": b(va),
+        "CHANNEL_LAST": b(cl),
         "USE_EXTERNAL_STREAM": b(ues),
     }
 

@@ -35,6 +35,7 @@ comptime APPLY_SILU = get_defined_bool["APPLY_SILU"]()
 comptime CONTIG_INNER = get_defined_bool["CONTIG_INNER"]()
 comptime ALIGNED_SEQ = get_defined_bool["ALIGNED_SEQ"]()
 comptime VEC_ALIGNED = get_defined_bool["VEC_ALIGNED"]()
+comptime CHANNEL_LAST = get_defined_bool["CHANNEL_LAST"]()
 comptime USE_EXTERNAL_STREAM = get_defined_bool["USE_EXTERNAL_STREAM"]()
 # When non-empty, the path `compile_function` dumps this variant's PTX to
 # (set via the `DUMP_ASSEMBLY_INTO` env var, threaded through `_jit_common`
@@ -99,6 +100,7 @@ def causal_conv1d_fwd_variant(
         CONTIG_INNER,
         ALIGNED_SEQ,
         VEC_ALIGNED,
+        CHANNEL_LAST,
         USE_EXTERNAL_STREAM,
         DUMP_ASSEMBLY_INTO,
     ](

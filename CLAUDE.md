@@ -550,6 +550,38 @@ on H100 fp16 to ~1.0-1.3× on the same shapes):
    `ATOMG.E.ADD.F32.STRONG.SYS` (system-scope, sequentially consistent
    — drains L2, sync with CPU), which added ~750ns/block on bwd. GPU-
    scope relaxed atomics are what CUDA's `atomicAdd` does.
+7. **Channel-last fwd kernel (`fwd_channellast_kernel`), Metal-only for
+   now.** When x/out have dim contiguous (`x.stride(1)==1`, the layout a
+   `(B, L, D)`-contiguous activation gets after `.transpose(1, 2)` —
+   upstream's `is_channel_last`), `fwd/_jit.py` dispatches a dedicated
+   kernel instead of the generic strided (fully scalar) fallback: no
+   smem, no barriers — one thread owns `kNElts` consecutive channels
+   (one 16-byte vector) and walks its block's seqlen rows sequentially,
+   carrying the (W-1)-row halo in registers; loads/stores stay fully
+   coalesced along dim. 3.9× over the scalar fallback on M4
+   (1327→337 µs at `(1,4096,2048,4)` fp16), within ~8% of the
+   seqlen-contiguous kernel and ~21% of the 120 GB/s roofline. Gated to
+   `use_external_stream == False` (mps) until validated on NVIDIA/AMD
+   hardware; seq_idx still takes the generic path. Rows-per-block is
+   picked at launch (64, halved down to 8 while total blocks < 512) —
+   small shapes are dispatch-bound anyway, large shapes keep the halo
+   re-read overhead at 3/64.
+
+## Apple/MPS interop: heap revival before every dispatch
+
+Mojo's Metal backend only declares its *own* allocations to the compute
+encoder (`useResource:` is skipped for foreign raw-address buffers), and
+macOS evicts idle GPU memory after ~1-1.5 s — so a Mojo kernel
+dispatched against torch MPS tensors whose heaps sat idle silently reads
+zeros and drops writes (root-caused + reported on the
+`mojo-cold-cache-bug-repro` branch, see its `BUG_REPORT.md`). The
+`_mps.revive_heaps` helper touches every argument tensor with a tiny
+batched torch op right before each dispatch (as a `pre_dispatch`
+callback that runs *after* the JIT compile), gated per-`data_ptr()` to
+at most one revival per 0.35 s. A busy dispatch loop cannot idle-evict
+(measured), so steady-state cost is nil. `CAUSAL_CONV1D_MPS_REVIVE=
+always|off` overrides. If mps outputs ever read all-zero again, suspect
+this machinery first.
 
 ## Where to look first when perf regresses
 

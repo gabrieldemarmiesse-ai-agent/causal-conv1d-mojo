@@ -30,7 +30,7 @@ from std.memory import stack_allocation
 from std.utils.index import StaticTuple
 from layout import TileTensor, TensorLayout, Idx, Coord
 
-from common import kNThreads, kNEltsFwd
+from common import kNThreads, kNThreadsCL, kNEltsFwd
 from _silu import _silu_f32
 
 
@@ -341,3 +341,160 @@ def fwd_kernel[
                 var t = seq_start + i
                 if t < seqlen:
                     output[batch_id, channel_id, t] = out_vals[i].cast[dtype]()
+
+
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(kNThreadsCL))
+)
+def fwd_channellast_kernel[
+    dtype: DType,
+    kWidth: Int,
+    has_bias: Bool,
+    has_initial_states: Bool,
+    apply_silu: Bool,
+](
+    seqlen: Int,
+    dim: Int,
+    rows_per_block: Int,
+    x_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    w_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    bias_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    initial_states_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    o_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    x_b_stride: UInt32,
+    x_l_stride: UInt32,
+    w_c_stride: UInt32,
+    o_b_stride: UInt32,
+    o_l_stride: UInt32,
+    is_b_stride: UInt32,
+    is_c_stride: UInt32,
+    is_l_stride: UInt32,
+):
+    """Causal conv1d forward for channel-last x/out (dim contiguous,
+    `x.stride(1) == 1`, seqlen strided).
+
+    Unlike upstream's CUDA channel-last kernel (128 threads, a
+    [W-1+64][64+kNElts] smem tile, two thread->work re-mappings and two
+    barriers), this exploits the layout directly with no shared memory
+    and no barriers: because dim is the contiguous axis, one thread owns
+    `kNElts` consecutive channels (a single 16-byte vector) and walks its
+    block's `kChunkLCL` seqlen rows sequentially, carrying the (W-1)-row
+    halo in registers. Loads and stores are fully coalesced along dim
+    (adjacent threads touch adjacent 16-byte slices of the same row) and
+    x/out are each touched exactly once per element — the roofline
+    minimum. The (W-1) halo rows before the chunk are re-read from
+    global (or `initial_states` / zero before t=0), matching upstream's
+    halo-by-reload approach.
+
+    Dispatch preconditions (gated in `_jit.py`): dim, x/out batch and
+    seqlen strides are all multiples of kNElts (so every vector access
+    is 16-byte aligned), weight is width-contiguous, and no seq_idx
+    (varlen falls back to the generic strided path).
+
+    `rows_per_block` is runtime, chosen by the launcher: 64 rows when
+    the grid is already wide enough, halving down to 8 for small shapes
+    where (batch x C-chunks x L-chunks) would otherwise leave the GPU
+    latency-starved. The trade is halo re-reads ((W-1)/rows extra x
+    traffic) against occupancy — at small shapes the kernel is latency-
+    bound, not bandwidth-bound, so more blocks win.
+
+    Raw pointers + UInt32 strides instead of TileTensor: same rationale
+    as `update/kernel.mojo` — with every stride dynamic there is nothing
+    for TileTensor's comptime layout machinery to fold away, and the
+    explicit address math keeps the prologue flat.
+    """
+    comptime accum_t = DType.float32
+    comptime kNElts: Int = kNEltsFwd[dtype]()
+
+    var tidx: Int = thread_idx.x
+    var batch_id: Int = block_idx.x
+    var chunk_l: Int = block_idx.y
+    var chunk_c: Int = block_idx.z
+
+    # This thread's kNElts consecutive channels.
+    var c0: Int = (chunk_c * kNThreadsCL + tidx) * kNElts
+    if c0 >= dim:
+        return
+
+    var x_base = x_ptr + batch_id * Int(x_b_stride) + c0
+    var o_base = o_ptr + batch_id * Int(o_b_stride) + c0
+
+    # ---- Load this thread's weights once (fp32 registers) ----
+    # weight is (dim, width) with width contiguous; per channel lane i,
+    # taps live at w_ptr[(c0+i)*w_c_stride + j].
+    var w_vecs = InlineArray[SIMD[accum_t, kNElts], kWidth](
+        fill=SIMD[accum_t, kNElts](0)
+    )
+
+    comptime for j in range(kWidth):
+
+        comptime for i in range(kNElts):
+            w_vecs[j][i] = w_ptr[(c0 + i) * Int(w_c_stride) + j].cast[
+                accum_t
+            ]()
+
+    # ---- Bias (unit stride, same assumption as fwd_kernel) ----
+    var bias_vec = SIMD[accum_t, kNElts](0)
+
+    comptime if has_bias:
+
+        comptime for i in range(kNElts):
+            bias_vec[i] = bias_ptr[c0 + i].cast[accum_t]()
+
+    var l0: Int = chunk_l * rows_per_block
+    var l_end: Int = min(l0 + rows_per_block, seqlen)
+
+    # ---- Halo: window[j] = x row (l0 - (W-1) + j), in fp32 ----
+    # Rows before t=0 come from initial_states (b, c, t + W - 1) or zero.
+    # The x-row reads are aligned vector loads; the initial_states reads
+    # stay scalar so arbitrary strides are fine (one-time cost of at
+    # most (W-1)*kNElts scalar loads per thread).
+    var window = InlineArray[SIMD[accum_t, kNElts], kWidth - 1](
+        fill=SIMD[accum_t, kNElts](0)
+    )
+
+    comptime for j in range(kWidth - 1):
+        var l_h: Int = l0 - (kWidth - 1) + j
+        if l_h >= 0:
+            window[j] = (
+                (x_base + l_h * Int(x_l_stride))
+                .load[width=kNElts, alignment=16]()
+                .cast[accum_t]()
+            )
+        else:
+
+            comptime if has_initial_states:
+
+                comptime for i in range(kNElts):
+                    window[j][i] = initial_states_ptr[
+                        batch_id * Int(is_b_stride)
+                        + (c0 + i) * Int(is_c_stride)
+                        + (l_h + kWidth - 1) * Int(is_l_stride)
+                    ].cast[accum_t]()
+
+    # ---- Walk the chunk's rows; slide the halo in registers ----
+    for l in range(l0, l_end):
+        var x_now = (
+            (x_base + l * Int(x_l_stride))
+            .load[width=kNElts, alignment=16]()
+            .cast[accum_t]()
+        )
+
+        var acc = bias_vec
+
+        comptime for j in range(kWidth - 1):
+            acc = w_vecs[j].fma(window[j], acc)
+        acc = w_vecs[kWidth - 1].fma(x_now, acc)
+
+        comptime if apply_silu:
+
+            comptime for i in range(kNElts):
+                acc[i] = _silu_f32(Float32(acc[i]))
+
+        (o_base + l * Int(o_l_stride)).store[alignment=16](
+            acc.cast[dtype]()
+        )
+
+        comptime for j in range(kWidth - 2):
+            window[j] = window[j + 1]
+        window[kWidth - 2] = x_now

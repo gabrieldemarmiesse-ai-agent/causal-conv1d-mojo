@@ -690,9 +690,12 @@ def _aggregate_absolute(rows: list[dict]) -> None:
     print("  " + "-" * 70)
     for r in rows:
         mojo = r["results"].get("mojo", {})
-        us = mojo.get("min_us", math.nan)
         a = r.get("metal_analysis") or {}
         h = a.get("headline") or {}
+        # Median of the (foreign-encoder-filtered) headline group — the
+        # same statistic _bench.py's own analysis prints, so the two
+        # surfaces can't disagree. Falls back to the Measurement min.
+        us = h.get("median_us", mojo.get("min_us", math.nan))
         clock = h.get("clock", "?")
         duty = (a.get("duty") or {}).get("busy_pct", math.nan)
         note = ""
