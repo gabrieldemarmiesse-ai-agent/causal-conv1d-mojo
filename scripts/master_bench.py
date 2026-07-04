@@ -121,9 +121,14 @@ REPO = Path(__file__).resolve().parent.parent
 
 # Canonical (quick) shape + full sweep, per function. Backend-independent —
 # the shapes that exercise the kernel are the same everywhere.
+# A `+cl` suffix on a shape means channel-last x/out (bench_kernel strips
+# it and passes --channel-last to _bench.py) — that layout dispatches the
+# dedicated fwd_channellast_kernel, which competes against upstream's own
+# channellast CUDA kernel and needs its own gate coverage.
 SHAPES = {
     "fwd": {
         "canon": "1,4096,2048,4",
+        "quick": ["1,4096,2048,4", "1,4096,2048,4+cl"],
         "full": [
             "1,1024,512,4",
             "1,1024,2048,4",
@@ -133,6 +138,9 @@ SHAPES = {
             "4,2048,2048,4",
             "4,4096,2048,4",
             "8,2048,4096,4",
+            "1,1024,2048,4+cl",
+            "1,4096,2048,4+cl",
+            "8,2048,4096,4+cl",
         ],
     },
     "update": {
@@ -140,7 +148,12 @@ SHAPES = {
         "full": ["1,512", "1,2048", "4,2048", "16,2048", "32,4096"],
     },
 }
-SHAPES["bwd"] = SHAPES["fwd"]
+# bwd has no channel-last kernel (the generic strided path handles that
+# layout) — gate only the contiguous shapes there.
+SHAPES["bwd"] = {
+    "canon": SHAPES["fwd"]["canon"],
+    "full": [s for s in SHAPES["fwd"]["full"] if not s.endswith("+cl")],
+}
 
 SUBPKG = {"fwd": "fwd", "bwd": "bwd_full", "update": "update"}
 
@@ -678,13 +691,15 @@ def bench_kernel(
         section(f"(c) {label} bench")
     reps = []
     for shape in shapes:
+        # `B,L,D,W+cl` = same shape, channel-last x/out layout.
+        channel_last = shape.endswith("+cl")
         cmd = [
             *taskset_prefix(),
             sys.executable,
             str(REPO / "scripts" / "_bench.py"),
             fn,
             "--shape",
-            shape,
+            shape.removesuffix("+cl"),
             "--dtype",
             dtype,
             "--device",
@@ -698,6 +713,7 @@ def bench_kernel(
             "--clock-locked",
             clock,
             "--json",
+            *(["--channel-last"] if channel_last else []),
             *baseline_flags,
         ]
         r = run(cmd, capture=True)
@@ -724,6 +740,15 @@ def bench_kernel(
     return reps
 
 
+def _shape_label(r: dict) -> str:
+    """`(1, 4096, 2048, 4)` plus a `+cl` tag for channel-last rows, so the
+    two layouts of one shape stay distinguishable in every table."""
+    label = str(tuple(r["shape"]))
+    if (r.get("config") or {}).get("channel_last"):
+        label += "+cl"
+    return label
+
+
 def _print_roofline(rows: list[dict]) -> None:
     """Memory-roofline verdict per shape (computed in _bench.py): bytes
     moved, achieved GB/s, % of the device's peak, and a regime — the
@@ -731,9 +756,16 @@ def _print_roofline(rows: list[dict]) -> None:
     have = [r for r in rows if r.get("roofline")]
     if not have:
         return
-    print(
-        f"\n  {'shape':>18} | {'moved':>9} | {'achieved':>11} | {'%peak':>6} | regime"
+    # Print the assumed peak so the % column is never a black box (the
+    # device table in _bench.py / CAUSAL_CONV1D_PEAK_GBPS is the source).
+    peaks = {r["roofline"]["peak_gbps"] for r in have if r["roofline"].get("peak_gbps")}
+    peak_note = (
+        f" (peak = {'/'.join(f'{p:.0f}' for p in sorted(peaks))} GB/s DRAM)"
+        if peaks
+        else " (no peak known for this device — set CAUSAL_CONV1D_PEAK_GBPS)"
     )
+    print(f"\n  memory roofline{peak_note}:")
+    print(f"  {'shape':>21} | {'moved':>9} | {'achieved':>11} | {'%peak':>6} | regime")
     print("  " + "-" * 72)
     hints = []
     for r in have:
@@ -742,12 +774,12 @@ def _print_roofline(rows: list[dict]) -> None:
         ach = f"{rl.get('achieved_gbps', '?')}GB/s"
         pct = f"{rl['pct_peak']:.0f}%" if rl.get("pct_peak") is not None else "?"
         print(
-            f"  {str(tuple(r['shape'])):>18} | {moved:>9} | {ach:>11} | "
+            f"  {_shape_label(r):>21} | {moved:>9} | {ach:>11} | "
             f"{pct:>6} | {rl['regime']}"
         )
         # Collect the actionable hints (skip near-peak "no lever" shapes).
         if rl.get("regime") not in ("memory-bound (near-peak)",) and rl.get("hint"):
-            hints.append((str(tuple(r["shape"])), rl["hint"]))
+            hints.append((_shape_label(r), rl["hint"]))
     for shape, hint in hints:
         print(f"    {shape}: {hint}")
 
@@ -795,7 +827,7 @@ def _aggregate_ratio(
     base = be.baseline
     rkey = f"mojo_over_{base}"
     print(
-        f"\n  {'shape':>18} | {'mojo us':>9} | {base[:6] + ' us':>9} | "
+        f"\n  {'shape':>21} | {'mojo us':>9} | {base[:6] + ' us':>9} | "
         f"{'ratio':>7} | {'spread':>7} | verdict"
     )
     print("  " + "-" * 78)
@@ -823,7 +855,7 @@ def _aggregate_ratio(
             ]
             verdict = "NO-BASELINE"
             Gate.fail(
-                f"no usable mojo/{base} measurement on {tuple(r['shape'])}"
+                f"no usable mojo/{base} measurement on {_shape_label(r)}"
                 + (f" ({'; '.join(errs)})" if errs else "")
             )
         else:
@@ -839,11 +871,11 @@ def _aggregate_ratio(
                 verdict = "SLOWER"
                 if be.gate_ratio:
                     Gate.fail(
-                        f"perf regression on {tuple(r['shape'])}: {ratio:.3f}x "
+                        f"perf regression on {_shape_label(r)}: {ratio:.3f}x "
                         f"(gap {gap:.1f}% > spread {spread:.1f}%)"
                     )
         print(
-            f"  {str(tuple(r['shape'])):>18} | {mojo:9.2f} | {bu:9.2f} | "
+            f"  {_shape_label(r):>21} | {mojo:9.2f} | {bu:9.2f} | "
             f"{ratio:6.3f}x | {spread:6.1f}% | {verdict}"
         )
     print("  " + "-" * 78)
@@ -877,12 +909,12 @@ def _aggregate_ratio(
             # A corrupt run must not seed or ratchet the baseline: a
             # silently-wrong kernel can do less work and time *faster*
             # than a healthy one, poisoning the ratchet low forever.
-            Gate.fail(f"output canary on {tuple(r['shape'])}: {canary}")
+            Gate.fail(f"output canary on {_shape_label(r)}: {canary}")
         elif ratchet is not None and us == us:
             note = ratchet.check(
                 r, us, refresh=ratchet_refresh, what=f"{be.name} kernel"
             )
-            print(f"  ratchet {str(tuple(r['shape'])):>18}: {us:9.2f} us — {note}")
+            print(f"  ratchet {_shape_label(r):>21}: {us:9.2f} us — {note}")
     if ratchet is not None:
         ratchet.save()
     _print_roofline(rows)
@@ -966,7 +998,7 @@ class _Ratchet:
             return "baseline reseeded" if refresh else "baseline established"
         if us > prev * self.tolerance:
             Gate.fail(
-                f"{what} regression on {tuple(r['shape'])}: {us:.2f} us vs "
+                f"{what} regression on {_shape_label(r)}: {us:.2f} us vs "
                 f"baseline {prev:.2f} us "
                 f"(>{(self.tolerance - 1) * 100:.0f}% over; "
                 f"--refresh-baseline to accept)"
@@ -1008,7 +1040,7 @@ def _aggregate_absolute(rows: list[dict], *, refresh: bool = False) -> None:
         return
     ratchet = _Ratchet(_METAL_BASELINE, _METAL_GATE_TOLERANCE)
 
-    print(f"\n  {'shape':>18} | {'kernel us':>10} | {'clock':>8} | {'duty%':>6} | note")
+    print(f"\n  {'shape':>21} | {'kernel us':>10} | {'clock':>8} | {'duty%':>6} | note")
     print("  " + "-" * 70)
     for r in rows:
         mojo = r["results"].get("mojo", {})
@@ -1028,10 +1060,10 @@ def _aggregate_absolute(rows: list[dict], *, refresh: bool = False) -> None:
             # A corrupt run must not seed or ratchet the baseline: a
             # silently-lost dispatch does less work and can time *faster*
             # than a healthy one, poisoning the ratchet low forever.
-            Gate.fail(f"output canary on {tuple(r['shape'])}: {canary}")
+            Gate.fail(f"output canary on {_shape_label(r)}: {canary}")
         elif us != us:  # NaN: zero timing data is a gate failure, not a note
             Gate.fail(
-                f"no usable metal kernel timing on {tuple(r['shape'])}: "
+                f"no usable metal kernel timing on {_shape_label(r)}: "
                 f"{mojo.get('error') or 'empty headline'}"
             )
         elif clock != "Maximum":
@@ -1042,14 +1074,13 @@ def _aggregate_absolute(rows: list[dict], *, refresh: bool = False) -> None:
             # on it, or thermal noise would spuriously fail CI and a slow
             # sample could poison the ratchet high.
             note = (note + "; " if note else "") + "inconclusive (clock != Maximum)"
-            warn(f"{tuple(r['shape'])}: clock {clock!r}, not Maximum — skipping gate")
+            warn(f"{_shape_label(r)}: clock {clock!r}, not Maximum — skipping gate")
         else:
             rnote = ratchet.check(r, us, refresh=refresh, what="metal kernel")
             note = (note + "; " if note else "") + rnote
 
         print(
-            f"  {str(tuple(r['shape'])):>18} | {us:10.2f} | {clock:>8} | "
-            f"{duty:6.1f} | {note}"
+            f"  {_shape_label(r):>21} | {us:10.2f} | {clock:>8} | {duty:6.1f} | {note}"
         )
     print("  " + "-" * 70)
     print("  absolute GPU time (mojo-only; upstream is CUDA-only — nothing to diff)")
@@ -1747,7 +1778,7 @@ def main() -> int:
             return 1
         for fn in fns:
             sh = SHAPES[fn]
-            shapes = [sh["canon"]] if tier == "quick" else sh["full"]
+            shapes = sh.get("quick", [sh["canon"]]) if tier == "quick" else sh["full"]
             if len(fns) > 1:
                 section(f"### function: {fn} ###")
             # Metal kernel-time runs are whole xctrace recordings (~30 s

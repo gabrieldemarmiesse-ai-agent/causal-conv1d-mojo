@@ -192,14 +192,24 @@ exist**:
   headroom (`memory-bound (near-peak)` → move on; `dispatch/latency-bound`
   → amortize launch). Peak BW is keyed per device with a
   `CAUSAL_CONV1D_PEAK_GBPS` override and *printed*, so the % is never a
-  black box; an unknown device omits the % rather than inventing one. On
-  Apple the same table serves device=cpu (unified memory: the SoC DRAM
-  peak bounds the CPU cluster too; the cpu env-sig gpu string carries the
-  brand — `cpu:Apple M4 x10` — so it matches); x86 CPUs have no entries
-  and rely on the env override. On metal the roofline % is only trusted
+  black box; an unknown device omits the % rather than inventing one. SKU
+  variants matter — the table distinguishes e.g. `H100 PCIe` (2.0 TB/s)
+  from SXM (3.35 TB/s); longest device-name substring wins. A shape whose
+  working set fits in L2/SLC can legitimately measure *above* DRAM peak —
+  that reports as `memory-bound (cache-resident)` (>110% of peak) rather
+  than pretending DRAM is the roofline. On Apple the same table serves
+  device=cpu (unified memory: the SoC DRAM peak bounds the CPU cluster
+  too; the cpu env-sig gpu string carries the brand — `cpu:Apple M4 x10`
+  — so it matches); x86 CPUs have no entries and rely on the env
+  override. On metal the roofline % is only trusted
   at Maximum clock — a throttled/unknown-clock run is marked `throttled`
   and the regression gate treats it as **inconclusive** (warn, don't fail,
   don't touch the baseline) so thermal noise can't spuriously fail CI.
+  Shapes suffixed `+cl` in `SHAPES` run with **channel-last** x/out
+  (`--channel-last`): the quick tier gates the canonical shape in both
+  layouts, and the FULL tier adds three channel-last shapes, so the
+  dedicated `fwd_channellast_kernel` is gated against upstream's own
+  channellast CUDA kernel (fwd only; bwd has no channel-last kernel).
 - **(d) deep profiler** — cuda: `ncu` (ephemeral via `pixi exec`); metal:
   the per-encoder GPU time + clock split + duty cycle already parsed from
   the step-(c) trace; cpu: `perf stat` on Linux, `/usr/bin/sample` on
@@ -619,22 +629,48 @@ on H100 fp16 to ~1.0-1.3× on the same shapes):
    `ATOMG.E.ADD.F32.STRONG.SYS` (system-scope, sequentially consistent
    — drains L2, sync with CPU), which added ~750ns/block on bwd. GPU-
    scope relaxed atomics are what CUDA's `atomicAdd` does.
-7. **Channel-last fwd kernel (`fwd_channellast_kernel`), Metal-only for
-   now.** When x/out have dim contiguous (`x.stride(1)==1`, the layout a
+7. **Channel-last fwd kernel (`fwd_channellast_kernel`), all backends.**
+   When x/out have dim contiguous (`x.stride(1)==1`, the layout a
    `(B, L, D)`-contiguous activation gets after `.transpose(1, 2)` —
    upstream's `is_channel_last`), `fwd/_jit.py` dispatches a dedicated
-   kernel instead of the generic strided (fully scalar) fallback: no
-   smem, no barriers — one thread owns `kNElts` consecutive channels
-   (one 16-byte vector) and walks its block's seqlen rows sequentially,
-   carrying the (W-1)-row halo in registers; loads/stores stay fully
-   coalesced along dim. 3.9× over the scalar fallback on M4
-   (1327→337 µs at `(1,4096,2048,4)` fp16), within ~8% of the
-   seqlen-contiguous kernel and ~21% of the 120 GB/s roofline. Gated to
-   `use_external_stream == False` (mps) until validated on NVIDIA/AMD
-   hardware; seq_idx still takes the generic path. Rows-per-block is
-   picked at launch (64, halved down to 8 while total blocks < 512) —
-   small shapes are dispatch-bound anyway, large shapes keep the halo
-   re-read overhead at 3/64.
+   kernel instead of the generic strided (fully scalar) fallback: one
+   thread owns `kNElts` consecutive channels (one 16-byte vector) and
+   walks its block's seqlen rows, carrying the (W-1)-row halo in
+   registers; loads/stores stay fully coalesced along dim. Three things
+   were needed to reach upstream parity on H100 (12.9 µs vs upstream's
+   12.9 µs at `(1,4096,2048,4)` fp16; was 423 µs on the scalar
+   fallback, 26 µs for the naive port):
+   - **Coalesced smem staging of the weight tile.** Per-thread scalar
+     weight reads (`w[(c0+i)*stride + j]`, 64-byte warp stride) cost
+     ~8× upstream's *total* L1 load-sector count on their own
+     (`l1tex__t_sectors_..._op_ld.sum` is the tell). The block now
+     cooperatively copies its `(kChunkC × W)` tile through smem
+     (tap-major so read-back is a conflict-free 16-byte smem vector
+     per tap), and bias is one 16-byte vector load.
+   - **Row-walk unrolled ×4** (`kUnroll`): 4 independent x-row loads
+     in flight per warp before any is consumed. The kernel is
+     register-capped at ~20 warps/SM (84 regs/thread), so one
+     outstanding load per warp left it `long_scoreboard`-stalled;
+     4× the MLP per warp closed the last 27% gap by itself.
+   - **Backend-aware rows-per-block target** (`kMinBlocksCL`): 64,
+     halved down to 4 while total blocks < 1024 on CUDA/HIP
+     (discrete GPUs need thousands of resident warps; halo re-reads
+     mostly hit L2) vs down to 8 while < 512 on Metal. On the bench
+     shape rows=16 beats rows=8 (halo traffic) and rows=32 (occupancy).
+   Also 3.9× over the scalar fallback on M4 (1327→337 µs, same shape),
+   within ~8% of the seqlen-contiguous kernel there. seq_idx still
+   takes the generic path (upstream is the opposite: their seq_idx
+   *requires* channel-last). The dispatch gate also requires 16B-aligned
+   x/out/bias base pointers (conforming strides alone don't guarantee
+   alignment for the 16-byte vector accesses) and `width <= 5` — the
+   unrolled walk carries the halo in `kUnroll = 4` registers, so wider
+   fp16/bf16 filters (we support up to 9) stay on the generic kernel.
+   Grid is `(L-chunks, batch, C-chunks)`: L-chunks is the only axis
+   that can blow past CUDA's 65535 grid.y/z cap (seqlen 4.2M+), so it
+   rides grid.x. Known gap: one tiny latency-bound shape
+   `(1,128,2048,4)` sits at ~1.25× upstream (3.5 vs 2.8 µs) — smaller
+   rows, direct weight loads, and pre-barrier halo hoisting were all
+   tried and regressed other shapes (see the Mojo gotchas below).
 
 ## CPU kernel design (`fwd_cpu/`, `bwd_full_cpu/`, `update_cpu/`)
 
@@ -733,6 +769,19 @@ this machinery first.
   `ptr + i` for offsets.
 - `comptime for x, y, ... in product(...)` only handles up to 4
   iterables. Nest loops or call `product` recursively.
+- `constrained[...]` doesn't resolve in this SDK's kernels — encode
+  comptime preconditions as comments + dispatcher gates instead. A
+  violated comptime bound (e.g. a negative `InlineArray` index) still
+  fails the `mojo build`, but only when that variant first JITs.
+- A *runtime* branch selecting between two ways to fill a register
+  array (e.g. "smem-staged vs direct weight loads, picked by
+  `rows_per_block`") pessimizes regalloc across the whole kernel —
+  measured 1.6-2x slowdowns even on shapes that always took the same
+  arm. If two load strategies are needed, specialize at comptime or
+  don't bother. Similarly, hoisting independent loads *earlier* (to
+  overlap a barrier) can lose by extending live ranges: this kernel
+  family is register-pressure-dominated; trust ncu's
+  `launch__registers_per_thread` over intuition and re-measure.
 - The `mojo build` cache (`~/.cache/causal_conv1d_mojo/`) bakes the
   *build env's* modular-lib path into each `.so`'s `RUNPATH`. If you
   switch uv envs the runtime loader can't find

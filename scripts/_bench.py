@@ -212,7 +212,8 @@ def _upstream_module():
 
 def _mojo_classifier(fn: str) -> Callable[[str], bool]:
     if fn == "fwd":
-        return lambda n: "fwd_kernel" in n and not n.startswith("void")
+        # Matches both fwd_kernel and fwd_channellast_kernel.
+        return lambda n: "fwd" in n and "kernel" in n and not n.startswith("void")
     if fn == "bwd":
         return lambda n: "bwd" in n and "kernel" in n and not n.startswith("void")
     if fn == "update":
@@ -1384,8 +1385,21 @@ _PEAK_GBPS = {
     "Apple M3": 100.0,
     "Apple M2": 100.0,
     "Apple M1": 68.0,
-    "H100": 3350.0,
-    "A100": 2039.0,
+    # NVIDIA names come from torch.cuda.get_device_name(); one SKU family
+    # spans a ~2x BW range, so list the variants (longest match wins).
+    "H100 PCIe": 2000.0,
+    "H100 NVL": 3900.0,
+    "H100": 3350.0,  # SXM
+    "H200": 4800.0,
+    "A100 40GB PCIe": 1555.0,
+    "A100-PCIE-40GB": 1555.0,
+    "A100-SXM4-40GB": 1555.0,
+    "A100": 2039.0,  # 80GB variants
+    "RTX 4090": 1008.0,
+    "RTX 5090": 1792.0,
+    "L40S": 864.0,
+    "MI300X": 5300.0,
+    "MI250": 3277.0,
 }
 _DTYPE_BYTES = {"fp16": 2, "bf16": 2, "fp32": 4}
 
@@ -1442,6 +1456,15 @@ def _roofline(cfg: Config, kernel_us: float, gpu: str) -> dict:
     if pct is None:
         r["regime"] = "unknown"
         r["hint"] = "set CAUSAL_CONV1D_PEAK_GBPS for this device to get a roofline %"
+    elif pct > 110:
+        # Faster than DRAM can physically stream ⇒ the working set is
+        # being served from cache (e.g. 33 MB fits H100's 50 MB L2).
+        # The DRAM roofline isn't the binding limit for this shape.
+        r["regime"] = "memory-bound (cache-resident)"
+        r["hint"] = (
+            "above DRAM peak — working set fits in L2/SLC, so the DRAM "
+            "roofline is not binding; treat the % as a cache-bandwidth number"
+        )
     elif pct >= 75:
         r["regime"] = "memory-bound (near-peak)"
         r["hint"] = "at the bandwidth roofline — no lever here; move to another shape"

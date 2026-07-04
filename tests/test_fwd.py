@@ -447,6 +447,25 @@ def test_fwd_wide_widths_fp16(device, W):
     assert _max_diff(out, ref) < _FWD_TOL[dtype]
 
 
+@pytest.mark.parametrize("W", [5, 6, 9])
+def test_fwd_wide_widths_fp16_channel_last(device, W):
+    """fp16 forward at wide widths with channel-last x.
+
+    Width 5 is the widest the dedicated channel-last kernel handles
+    (its unrolled walk carries the halo in kUnroll=4 registers); wider
+    filters must fall back to the generic kernel — a width-unaware
+    dispatch gate would send them to a kernel that can't even compile
+    (regression test for the `width <= 5` term in fwd/_jit.py).
+    """
+    B, D, L = 2, 64, 128
+    dtype = torch.float16
+    x = torch.randn(B, L, D, dtype=dtype, device=device).transpose(1, 2)
+    weight = torch.randn(D, W, dtype=dtype, device=device)
+    out = causal_conv1d_mojo.causal_conv1d_fn(x, weight, activation="silu")
+    ref = causal_conv1d_mojo.causal_conv1d_ref(x, weight, activation="silu")
+    assert _max_diff(out, ref) < _FWD_TOL[dtype]
+
+
 def test_fwd_width5_fp32(device):
     """fp32 forward at the new width=5 (fp32 max — width 6+ would
     require a wider halo than kNElts=4 provides)."""
