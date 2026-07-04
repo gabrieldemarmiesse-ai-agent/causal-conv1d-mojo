@@ -85,9 +85,7 @@ def _config_from_args(args: tuple) -> tuple:
     # passes 0). Can't be derived from `stream_handle_addr` itself
     # because torch's default CUDA stream has cuda_stream == 0.
     use_external_stream = bool(args[29])
-    # Channel-last fast path (Metal only for now — correct but untested
-    # on NVIDIA/AMD hardware, where the generic strided path keeps
-    # handling this layout): x/out have dim contiguous (stride(1)==1)
+    # Channel-last fast path: x/out have dim contiguous (stride(1)==1)
     # and seqlen strided — the layout a (B, L, D)-contiguous activation
     # gets after .transpose(1, 2), i.e. upstream's `is_channel_last`
     # condition. The dedicated kernel vectorizes along dim, so dim and
@@ -98,7 +96,11 @@ def _config_from_args(args: tuple) -> tuple:
     # channel-last).
     kn = _KN_ELTS[dtype_code]
     channel_last = (
-        not use_external_stream
+        # The unrolled row walk carries the halo in xv registers, which
+        # requires width - 1 <= kUnroll (= 4 in kernel.mojo). Wider
+        # filters (fp16/bf16 allow up to 9) fall back to the generic
+        # kernel, whose halo ring supports width - 1 <= kNElts = 8.
+        width <= 5
         and args[8] == 1  # x dim-contiguous
         and args[9] > 1  # x seqlen strided (else the contig path wins)
         and args[13] == 1  # out dim-contiguous
@@ -110,6 +112,12 @@ def _config_from_args(args: tuple) -> tuple:
         and args[9] % kn == 0  # x seqlen stride
         and args[12] % kn == 0  # out batch stride
         and args[14] % kn == 0  # out seqlen stride
+        # Base pointers must be 16B-aligned too: conforming strides
+        # don't guarantee it (e.g. a channel slice at an odd offset),
+        # and the kernel's loads/stores are alignment=16 vectors.
+        and args[0] % 16 == 0  # x
+        and args[3] % 16 == 0  # out
+        and (not has_bias or args[2] % 16 == 0)  # bias
     )
     if channel_last:
         # These three only parameterize the generic kernel; pin them so

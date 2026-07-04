@@ -131,20 +131,34 @@ def launch_fwd[
             dump_asm=dump_assembly_into,
         ]()
         # Seqlen rows per block: 64 when the grid is already wide, halved
-        # down to 8 while the total block count sits under ~512 (small
-        # shapes are latency-bound — more, shorter blocks beat the halo
-        # re-read cost of (W-1)/rows extra x traffic).
+        # down to 8 while the total block count sits under the latency-
+        # hiding target (small shapes are latency-bound — more, shorter
+        # blocks beat the halo re-read cost of (W-1)/rows extra x
+        # traffic, which mostly hits L2 anyway since the adjacent block
+        # just loaded those rows). The target is backend-comptime: a
+        # discrete NVIDIA/AMD part needs thousands of resident warps to
+        # hide DRAM latency (H100: 114 SMs x 64 warps), while Apple's
+        # unified-memory GPUs saturate with far fewer.
+        comptime kMinBlocksCL = 1024 if use_external_stream else 512
+        # Floor: 4 on discrete GPUs (small-seq / narrow-dim shapes are
+        # pure latency-bound there — a 75% halo re-read on a shape this
+        # small is irrelevant next to leaving SMs idle), 8 on Apple.
+        comptime kMinRowsCL = 4 if use_external_stream else 8
         var n_chunks_c = ceildiv(dim_int, kNThreadsCL * kNEltsFwd[dtype]())
         var rows_per_block = kChunkLCL
         while (
-            rows_per_block > 8
+            rows_per_block > kMinRowsCL
             and batch_int * n_chunks_c * ceildiv(seqlen_int, rows_per_block)
-            < 512
+            < kMinBlocksCL
         ):
             rows_per_block //= 2
+        # (L-chunks, batch, C-chunks) — L-chunks on grid.x because it is
+        # the only axis that can exceed CUDA's 65535 grid.y/z cap (e.g.
+        # seqlen 4.2M+ at rows_per_block=64); see the kernel's block_idx
+        # mapping.
         var grid_cl = (
-            batch_int,
             ceildiv(seqlen_int, rows_per_block),
+            batch_int,
             n_chunks_c,
         )
         comptime if use_external_stream:
