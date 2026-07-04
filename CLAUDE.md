@@ -39,13 +39,19 @@ upstream Tri Dao CUDA", with upstream as the moving target.
     must not share cache entries), and `<mod_name>` is a readable
     config string like `fp16_w4_hb0_hs0_hi0_silu0_contig1_aligned1`.
     See "Cache-key contents" below for what `<h>` covers.
-  - `fwd_cpu/`, `bwd_full_cpu/`, `update_cpu/`: CPU fallbacks. Same
+  - `fwd_cpu/`, `bwd_full_cpu/`, `update_cpu/`: CPU kernels. Same
     JIT-on-first-use plumbing as the GPU subpackages — each (subpkg,
     config) compiles its own `.so` via `mojo build` and caches under
     `$XDG_CACHE_HOME/causal_conv1d_mojo/<sub>_cpu/cpu/<cpu_tag>/<mod_name>.hash-<h>.so`.
     No GPU `arch` subdir for CPU (obviously), but the same
     `<cpu_tag>` segment applies — host-CPU SIMD baked into the `.so`
-    is the dominant factor here.
+    is the dominant factor here. No `launch.mojo` (nothing to launch)
+    and no `common.mojo`: the kernels take raw pointers + element
+    strides straight from `variant.mojo` (no TileTensor — the hot
+    loops index rows manually so they can issue unaligned SIMD
+    loads/stores along t). See "CPU kernel design" below for the
+    vectorization/parallelism pattern and the fwd↔update bit-exactness
+    contract.
   - `_jit_common.py`: shared variant cache + compile + load helper used
     by every subpackage. Also owns the env-signature → cache-hash
     logic (see below).
@@ -144,16 +150,19 @@ exist**:
 - **(a) lock clocks** — cuda: `nvidia-smi`; rocm: `rocm-smi --setperflevel
   high`; metal: forces Induced GPU Performance State to Maximum via
   `scripts/_apple_gpu_clock_lock.py` (see "Apple silicon: forcing the GPU
-  clock" below); cpu: no GPU clock, skipped. A **hard gate** on
-  cuda/rocm/metal: a failed lock exits non-zero instead of continuing
-  unlocked (unlocked numbers aren't comparable across runs, which defeats
-  an agentic perf loop). `--no-lock` opts out for local dev.
+  clock" below); cpu: best-effort — Linux sets the cpufreq governor to
+  `performance` via `sudo -n` (restored on exit) and macOS has no
+  userspace CPU-DVFS control at all, so a failed cpu lock warns and
+  continues (the cpu ratchet tolerance is sized for that noise). A
+  **hard gate** on cuda/rocm/metal: a failed lock exits non-zero instead
+  of continuing unlocked (unlocked numbers aren't comparable across runs,
+  which defeats an agentic perf loop). `--no-lock` opts out for local dev.
 - **(b) recompile + correctness** — clears *our* JIT cache, runs the quick
   smoke / `--full` regression suite under the backend's `uv` extra and
   device (`-k mps/cuda/cpu`). `--skip-correctness` runs the perf phases
   only (e.g. to profile a WIP kernel).
 - **(c) kernel-time bench** — cuda: vs Tri Dao upstream with min+spread and
-  a 3% stop-criterion (a true perf *gate*); rocm/cpu: vs the pure-PyTorch
+  a 3% stop-criterion (a true perf *gate*); rocm: vs the pure-PyTorch
   fallback (reported, not gated — no hand-tuned baseline exists); metal:
   *absolute* per-kernel GPU time read back from a `xctrace` Metal System
   Trace (mojo-only — upstream is CUDA-only), **gated two ways**: a
@@ -167,22 +176,38 @@ exist**:
   contributing its foreign-encoder-filtered headline median as one run);
   the master bench records 1 in quick tier / 3 in `--full`. The
   metal *walltime* step (h) is tagged `unlocked` — the clock lock is an
-  xctrace template, so it never applies outside recordings. Every backend
-  also prints a **memory-roofline verdict** per shape (bytes moved,
-  achieved GB/s, % of the device's peak DRAM bandwidth, theoretical floor
-  time, and a regime + one-line hint) — the "is this number good?" an
-  agent needs to decide whether a shape has headroom (`memory-bound
-  (near-peak)` → move on; `dispatch/latency-bound` → amortize launch).
-  Peak BW is keyed per device with a `CAUSAL_CONV1D_PEAK_GBPS` override
-  and *printed*, so the % is never a black box; an unknown device omits
-  the % rather than inventing one. On metal the roofline % is only trusted
+  xctrace template, so it never applies outside recordings. cpu: per-call
+  CPU kernel time (`_bench.py --measure kernel` on cpu times the
+  synchronous call directly — median over iters; there are no device
+  events to attribute) vs the pure-PyTorch fallback; the pytorch ratio is
+  informational (not a tuned baseline), and the gate is the **same
+  canary + ratchet pair as metal**, persisted in
+  `scripts/baselines/cpu_kernel_time.json` (gitignored; >25% over this
+  machine's best fails — looser than metal's 10% since there is no cpu
+  clock lock on darwin; faster runs ratchet down; `--refresh-baseline`
+  reseeds). Every backend also prints a **memory-roofline verdict** per
+  shape (bytes moved, achieved GB/s, % of the device's peak DRAM
+  bandwidth, theoretical floor time, and a regime + one-line hint) — the
+  "is this number good?" an agent needs to decide whether a shape has
+  headroom (`memory-bound (near-peak)` → move on; `dispatch/latency-bound`
+  → amortize launch). Peak BW is keyed per device with a
+  `CAUSAL_CONV1D_PEAK_GBPS` override and *printed*, so the % is never a
+  black box; an unknown device omits the % rather than inventing one. On
+  Apple the same table serves device=cpu (unified memory: the SoC DRAM
+  peak bounds the CPU cluster too; the cpu env-sig gpu string carries the
+  brand — `cpu:Apple M4 x10` — so it matches); x86 CPUs have no entries
+  and rely on the env override. On metal the roofline % is only trusted
   at Maximum clock — a throttled/unknown-clock run is marked `throttled`
   and the regression gate treats it as **inconclusive** (warn, don't fail,
   don't touch the baseline) so thermal noise can't spuriously fail CI.
 - **(d) deep profiler** — cuda: `ncu` (ephemeral via `pixi exec`); metal:
   the per-encoder GPU time + clock split + duty cycle already parsed from
-  the step-(c) trace; cpu: `perf stat`; rocm: skipped (`rocprofv3` can't
-  instrument Mojo's `DeviceContext`).
+  the step-(c) trace; cpu: `perf stat` on Linux, `/usr/bin/sample` on
+  darwin (spawns the raw bench loop sized off the step-(c) time, samples
+  it mid-loop, prints the top-of-stack leaf counts — where the time goes:
+  the Mojo kernel vs Python marshalling vs the parallel runtime; full
+  call tree saved under `scripts/baselines/sample_<fn>_cpu.txt`); rocm:
+  skipped (`rocprofv3` can't instrument Mojo's `DeviceContext`).
 - **(e) dump GPU asm** — cuda: PTX/SASS to `scripts/assembly/nvidia/`;
   rocm: the AMDGPU ISA to `scripts/assembly/rocm/`; metal: skipped (Mojo
   emits no textual Metal ISA — it lowers straight to a `metallib`); cpu:
@@ -198,8 +223,10 @@ Steps c/d/h are deliberately separate processes.
 
 The `summary` section ends with a machine-readable **`===AGENT-SUMMARY===`**
 block (one JSON object: backend, device, tier, gate pass/fail, and a
-per-shape list of `{fn, shape, dtype, kernel_us, achieved_gbps, pct_peak,
-regime, hint, ratio_over_upstream}`). An agent driving a perf loop can
+per-shape list of `{fn, shape, dtype, channel_last, kernel_us,
+achieved_gbps, pct_peak, regime, hint, ratio_over_upstream,
+ratio_over_pytorch}` — the last is how rocm/cpu surface their fallback
+ratio). An agent driving a perf loop can
 slice that out between the delimiters instead of scraping the human
 tables — it's the fastest way to see, per shape, whether there's headroom
 and what to try next.
@@ -327,6 +354,18 @@ match on substring `fwd_kernel` and the upstream `void
 causal_conv1d_fwd_kernel` prefix — update them if the Mojo build naming
 changes. The pure-pytorch impl has no single named kernel, so it sums
 every CUDA event in the profiled region.
+
+On `--device cpu` there are no device events (and the Mojo CPU kernel
+isn't a torch op, so torch.profiler couldn't attribute it anyway):
+`--measure kernel` instead times the synchronous kernel call per-call
+and reports the median over `--iters` (robust to scheduler blips). It
+includes the Python argument marshalling — an inherent per-call cost of
+the CPU path — and attaches the same all-zero/non-finite output canary
+the metal path has (`"canary"` in the JSON report; master_bench gates
+on it). The bwd callable on cpu builds the autograd graph once and
+re-runs only `torch.autograd.grad`, so the "bwd" number is backward-only
+(same trick as mps, different reason: no name-based classifier to
+isolate the bwd kernel from a fused fwd+bwd call).
 
 ### 2. NSight Compute (`ncu`)
 
@@ -596,6 +635,58 @@ on H100 fp16 to ~1.0-1.3× on the same shapes):
    picked at launch (64, halved down to 8 while total blocks < 512) —
    small shapes are dispatch-bound anyway, large shapes keep the halo
    re-read overhead at 3/64.
+
+## CPU kernel design (`fwd_cpu/`, `bwd_full_cpu/`, `update_cpu/`)
+
+The CPU kernels were rewritten from scalar TileTensor loops to
+raw-pointer kernels with an explicitly vectorized main body (3.4–6.5×
+on fwd/bwd, up to ~140× on update at M4 decode shapes). The patterns:
+
+1. **Raw pointers + element strides, no TileTensor.** `variant.mojo`
+   decodes the args tuple into `UnsafePointer` + `Int` strides; each
+   row's base pointer is computed once and the hot loop indexes
+   `row[t * ls]`. This is what lets the fast path issue unaligned
+   vector loads/stores along t.
+2. **Boundary/main split.** Per (b, d) row: t < W-1 runs a scalar
+   helper that keeps the `src_t < 0` handling (initial_states /
+   implicit zeros); t >= W-1 is branch-free (every tap in-range). The
+   main region vectorizes (kV = 32 bytes of x per tap load) when
+   x/out (and dout/dx for bwd) are unit-stride along t and there is no
+   seq_idx; otherwise it falls back to the same scalar helper. W
+   overlapping unaligned vector loads per kV outputs all hit L1 —
+   DRAM sees each element once.
+3. **bwd: chunked two-pass with a stack dpre buffer.** Pass A
+   recomputes `pre` from the x taps, forms `dpre` (silu' in f32),
+   stores it into a `kChunk`-entry stack buffer (512, plus `width`
+   slack so the cross-seam extension region fits) *and* folds the
+   dweight/dbias partial sums in the same step (the x taps are already
+   in registers — dweight is nearly free). Pass B computes dx from the
+   buffered dpre window. The buffer extends W-1 past the chunk so pass
+   B never crosses a seam. dweight/dbias flush per row via relaxed
+   atomics (fp32 accumulators), as before.
+4. **Task-chunked parallelism.** All three kernels deal `batch*dim`
+   rows to at most `8 * num_logical_cores()` contiguous row-chunks via
+   `sync_parallelize` — one task per *row* drowned small rows in
+   dispatch overhead (the old update kernel spent ~24 ms on a
+   (32, 4096) decode step; chunked it's ~170 µs).
+5. **fwd↔update bit-exactness contract.** `test_update` pins the
+   decode loop against the one-shot forward at zero tolerance for
+   fp16/bf16, so every path that produces an output element — fwd
+   scalar boundary, fwd vector body, fwd scalar tail, update's
+   per-token loop — accumulates with the *same* explicit
+   ascending-k `fma` chain in f32, then the shared `_silu_f32`
+   (`_silu.mojo`, width-generic; vector callers bind `[kV]`).
+   Skipped taps (fwd boundary) and zero history (update) agree because
+   `fma(0, w, acc) == acc` exactly. If you touch the accumulation
+   order, fma-ness, or silu of one kernel, touch all of them.
+6. **Perf profile on M4** (fp32, silu, clock-unlockable): fwd large
+   shapes sit at ~50 GB/s of the 120 GB/s roofline — the vector
+   `exp` in silu is the limiter (~1.7 ns/elem single-core vs 0.29
+   without silu), not bandwidth; bwd ~30 GB/s (double exp-ish work per
+   element: silu' recompute); update is dispatch-bound below ~100 µs.
+   Parallel scaling is near-ideal for ≥ 40 µs of work per task and
+   collapses below ~10 µs/task (Mojo runtime wake-up latency) — don't
+   shrink TASKS_PER_CORE chunks further.
 
 ## Apple/MPS interop: heap revival before every dispatch
 

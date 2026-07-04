@@ -2,14 +2,13 @@
 
 Runtime args tuple (22 positionals) is built in
 ``update_cpu/__init__.py``; comptime values come from `-D` defines.
+The kernel takes raw pointers + element strides (no TileTensor).
 """
 
 from std.os import abort
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 from std.sys import get_defined_bool, get_defined_dtype, get_defined_int
-from layout import TileTensor, Idx
-from layout.tile_layout import Layout
 
 from kernel import update_kernel_cpu
 
@@ -34,17 +33,17 @@ def causal_conv1d_update_cpu_variant(
     var dim_int = Int(py=args[6])
     var seqlen_int = Int(py=args[7])
     var state_len_int = Int(py=args[8])
-    var x_b_stride = Int32(py=args[9])
-    var x_c_stride = Int32(py=args[10])
-    var x_l_stride = Int32(py=args[11])
-    var w_c_stride = Int32(py=args[12])
-    var w_w_stride = Int32(py=args[13])
-    var state_b_stride = Int32(py=args[14])
-    var state_c_stride = Int32(py=args[15])
-    var state_l_stride = Int32(py=args[16])
-    var o_b_stride = Int32(py=args[17])
-    var o_c_stride = Int32(py=args[18])
-    var o_l_stride = Int32(py=args[19])
+    var x_b_stride = Int(py=args[9])
+    var x_c_stride = Int(py=args[10])
+    var x_l_stride = Int(py=args[11])
+    var w_c_stride = Int(py=args[12])
+    var w_w_stride = Int(py=args[13])
+    var state_b_stride = Int(py=args[14])
+    var state_c_stride = Int(py=args[15])
+    var state_l_stride = Int(py=args[16])
+    var o_b_stride = Int(py=args[17])
+    var o_c_stride = Int(py=args[18])
+    var o_l_stride = Int(py=args[19])
     var state_indices_addr = Int(py=args[20])
     var cache_seqlens_addr = Int(py=args[21])
 
@@ -73,34 +72,6 @@ def causal_conv1d_update_cpu_variant(
         unsafe_from_address=o_addr
     )
 
-    var x_tt = TileTensor(
-        x_ptr,
-        Layout(
-            (batch_int, dim_int, seqlen_int),
-            (x_b_stride, x_c_stride, x_l_stride),
-        ),
-    )
-    var w_tt = TileTensor(
-        w_ptr,
-        Layout(
-            (dim_int, Idx[WIDTH]),
-            (w_c_stride, w_w_stride),
-        ),
-    )
-    var state_tt = TileTensor(
-        state_ptr,
-        Layout(
-            (batch_int, dim_int, state_len_int),
-            (state_b_stride, state_c_stride, state_l_stride),
-        ),
-    )
-    var o_tt = TileTensor(
-        o_ptr,
-        Layout(
-            (batch_int, dim_int, seqlen_int),
-            (o_b_stride, o_c_stride, o_l_stride),
-        ),
-    )
     update_kernel_cpu[
         DTYPE,
         WIDTH,
@@ -108,22 +79,29 @@ def causal_conv1d_update_cpu_variant(
         APPLY_SILU,
         HAS_STATE_INDICES,
         IS_CIRCULAR,
-        type_of(x_tt).LayoutType,
-        type_of(w_tt).LayoutType,
-        type_of(state_tt).LayoutType,
-        type_of(o_tt).LayoutType,
     ](
         batch_int,
         dim_int,
         seqlen_int,
         state_len_int,
-        x_tt.as_immut(),
-        w_tt.as_immut(),
+        x_ptr,
+        x_b_stride,
+        x_c_stride,
+        x_l_stride,
+        w_ptr,
+        w_c_stride,
+        w_w_stride,
         b_ptr,
-        state_tt,
+        state_ptr,
+        state_b_stride,
+        state_c_stride,
+        state_l_stride,
         state_indices_ptr,
         cache_seqlens_ptr,
-        o_tt,
+        o_ptr,
+        o_b_stride,
+        o_c_stride,
+        o_l_stride,
     )
     return PythonObject(None)
 

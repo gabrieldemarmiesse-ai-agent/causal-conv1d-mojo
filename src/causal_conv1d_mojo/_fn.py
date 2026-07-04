@@ -286,10 +286,16 @@ class _CausalConv1dFn(torch.autograd.Function):
         # the kernel writes it unconditionally to keep the dispatch lean
         # (one comptime flag instead of two). We only return it when the
         # user actually wants the gradient, but the kernel populates it
-        # in place either way.
-        dinitial_states = (
-            torch.empty_like(initial_states) if initial_states is not None else None
-        )
+        # in place either way. seqlen == 0 is the one exception: the
+        # kernels early-return without touching it, and the correct
+        # gradient of an unused initial state is exactly zero — zero-fill
+        # so autograd never hands back uninitialized memory.
+        if initial_states is None:
+            dinitial_states = None
+        elif x.shape[-1] == 0:
+            dinitial_states = torch.zeros_like(initial_states)
+        else:
+            dinitial_states = torch.empty_like(initial_states)
 
         torch.ops.causal_conv1d_mojo._bwd_full_inplace(
             x,
