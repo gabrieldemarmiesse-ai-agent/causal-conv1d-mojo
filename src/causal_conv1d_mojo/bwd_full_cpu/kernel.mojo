@@ -1,83 +1,99 @@
 """Pure-mojo CPU fused backward for causal_conv1d.
 
 No upstream analogue — this exists so the package works on a machine
-without a GPU. The GPU kernels in `causal_conv1d_fwd.mojo` /
-`causal_conv1d_bwd.mojo` are the real product; the CPU paths are the
-slow fallback.
+without a GPU. The GPU kernels under `bwd_full/` are the real product;
+this is the fallback — but a fast one.
 
-Computes `dx, dweight, dbias` from `x, weight, bias, dout`. Uses a
-sliding window of `width` dpre values to avoid materialising the full
-`dpre` tensor:
+Computes `dx, dweight, dbias, dinitial_states` from
+`x, weight, bias, dout`:
 
+    dpre[t]     = dout[t] * silu'(pre[t])   (or dout[t] when no silu)
     dx[t]       = sum_k weight[W-1-k] * dpre[t + k]
-    dweight[w] += sum_t x[t + w - (W-1)] * dpre[t]
+    dweight[k] += sum_t x[t + k - (W-1)] * dpre[t]
     dbias      += sum_t dpre[t]
 
-where `dpre[t] = silu'(pre[t]) * dout[t]`.
+Fast path (no seq_idx, x/dout/dx unit-stride along t): per row, walk
+seqlen in kChunk-sized pieces with a small stack buffer of dpre:
+
+  * pass A (vectorized, kV lanes/step): recompute `pre` from the x tap
+    loads, form `dpre`, store it to the buffer — and fold the
+    dweight/dbias partial sums in the same step, reusing the x taps
+    already in registers (dweight is nearly free);
+  * pass B (vectorized): `dx` from the buffered dpre window.
+
+The buffer extends `W-1` past the chunk (recomputed next chunk) so
+pass B never crosses a chunk seam; positions past seqlen buffer as 0.
+The first `W-1` positions of the row are handled scalar (history
+reaches initial_states / zeros), as is the last partial vector.
+
+Rows with seq_idx or non-unit strides take the scalar sliding-window
+path (same recurrence, one dpre window in registers).
+
+Parallelised over (batch*dim) rows dealt to at most
+`8 * num_logical_cores()` contiguous row-chunks (see fwd_cpu). Workers
+may share a `d` across batches, so per-row dweight/dbias partials are
+flushed with relaxed atomics.
 """
 
 from std.algorithm import sync_parallelize
-from std.math import exp
 from std.atomic import Atomic, Ordering
-from layout import TileTensor, TensorLayout
+from std.math import exp, recip
+from std.sys import size_of
+from std.sys.info import num_logical_cores
+
+comptime TASKS_PER_CORE = 8
+# dpre values buffered per chunk of the fast path (fp32; +width slack for
+# the cross-seam extension). 512 keeps the buffer + row working set deep
+# in L1 while amortizing the per-chunk scalar seams.
+comptime kChunk = 512
 
 
 @always_inline
-def _cpu_dpre_at[
+def _silu_grad_v[w: Int](
+    pre: SIMD[DType.float32, w]
+) -> SIMD[DType.float32, w]:
+    """d(silu)/dpre = sig * (1 + pre * (1 - sig)), elementwise."""
+    var one = SIMD[DType.float32, w](1)
+    var sig = recip(one + exp(-pre))
+    return sig * (one + pre * (one - sig))
+
+
+@always_inline
+def _dpre_scalar[
     dtype: DType,
     width: Int,
     has_seq_idx: Bool,
     has_initial_states: Bool,
     apply_silu: Bool,
-    XLayoutType: TensorLayout,
-    DoutLayoutType: TensorLayout,
-    SLayoutType: TensorLayout,
-    ILayoutType: TensorLayout,
 ](
     t: Int,
-    b: Int,
-    d: Int,
     seqlen: Int,
     bias_v: Float32,
     weights: SIMD[DType.float32, width],
-    x: TileTensor[dtype, XLayoutType, ImmutAnyOrigin],
-    dout: TileTensor[dtype, DoutLayoutType, ImmutAnyOrigin],
-    seq_idx: TileTensor[DType.int32, SLayoutType, ImmutAnyOrigin],
-    initial_states: TileTensor[dtype, ILayoutType, ImmutAnyOrigin],
-) -> Float32 where (
-    TileTensor[dtype, XLayoutType, ImmutAnyOrigin].flat_rank == 3
-    and TileTensor[dtype, DoutLayoutType, ImmutAnyOrigin].flat_rank == 3
-    and TileTensor[DType.int32, SLayoutType, ImmutAnyOrigin].flat_rank == 2
-    and TileTensor[dtype, ILayoutType, ImmutAnyOrigin].flat_rank == 3
-):
-    """`dpre[t]` for the CPU backward, 0 if `t` is out of [0, seqlen).
-
-    With `apply_silu`, `dpre[t] = silu'(pre[t]) * dout[t]` (the bias-aware
-    sigmoid-derivative path). Without it, `dpre[t] = dout[t]` directly —
-    bias-only forward has identity gradient w.r.t. pre.
-
-    With `has_seq_idx`, returns 0 if `seq_idx[t] < 0` (padding token whose
-    output was forced to 0 in the forward); the silu_grad recomputation
-    of `pre[t]` masks historical x reads on
-    `seq_idx[src_t] == seq_idx[t]` to mirror the forward gate.
-
-    With `has_initial_states`, the silu_grad pre recomputation reads
-    `initial_states[src_t + W - 1]` for `src_t ∈ [-(W-1), 0)` instead of
-    treating those positions as zero (mirrors the forward).
-    """
+    x_row: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    x_ls: Int,
+    dout_row: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    dout_ls: Int,
+    si_row: UnsafePointer[Int32, MutAnyOrigin],
+    si_ls: Int,
+    init_row: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    is_ls: Int,
+) -> Float32:
+    """`dpre[t]`, 0 outside [0, seqlen). Scalar; mirrors the forward's
+    boundary/seq_idx gating when recomputing `pre` for the silu grad."""
     if t < 0 or t >= seqlen:
         return 0
 
     var cur_id: Int32 = 0
 
     comptime if has_seq_idx:
-        cur_id = seq_idx[b, t]
+        cur_id = si_row[t * si_ls]
         if cur_id < 0:
             # Padding: forward forced out=0, so dpre is zero too.
             return 0
 
     comptime if not apply_silu:
-        return dout[b, d, t].cast[DType.float32]()
+        return dout_row[t * dout_ls].cast[DType.float32]()
 
     var pre: Float32 = bias_v
 
@@ -87,22 +103,24 @@ def _cpu_dpre_at[
             var include: Bool = True
 
             comptime if has_seq_idx:
-                var src_id: Int32 = seq_idx[b, src_t]
-                include = src_id == cur_id
+                include = si_row[src_t * si_ls] == cur_id
             if include:
-                pre += weights[k] * x[b, d, src_t].cast[DType.float32]()
+                pre = (
+                    x_row[src_t * x_ls]
+                    .cast[DType.float32]()
+                    .fma(weights[k], pre)
+                )
         else:
 
             comptime if has_initial_states:
                 var is_idx: Int = src_t + (width - 1)
-                pre += (
-                    weights[k]
-                    * initial_states[b, d, is_idx].cast[DType.float32]()
+                pre = (
+                    init_row[is_idx * is_ls]
+                    .cast[DType.float32]()
+                    .fma(weights[k], pre)
                 )
-    var sig: Float32 = 1.0 / (1.0 + exp(-pre))
-    var silu_grad: Float32 = sig * (1.0 + pre * (1.0 - sig))
-    var dout_v = dout[b, d, t].cast[DType.float32]()
-    return dout_v * silu_grad
+    var dout_v = dout_row[t * dout_ls].cast[DType.float32]()
+    return dout_v * _silu_grad_v[1](pre)
 
 
 def bwd_kernel_cpu[
@@ -112,203 +130,360 @@ def bwd_kernel_cpu[
     has_seq_idx: Bool,
     has_initial_states: Bool,
     apply_silu: Bool,
-    XLayoutType: TensorLayout,
-    WLayoutType: TensorLayout,
-    DoutLayoutType: TensorLayout,
-    DxLayoutType: TensorLayout,
-    SLayoutType: TensorLayout,
-    ILayoutType: TensorLayout,
-    DILayoutType: TensorLayout,
 ](
     batch: Int,
     dim: Int,
     seqlen: Int,
-    x: TileTensor[dtype, XLayoutType, ImmutAnyOrigin],
-    weight: TileTensor[dtype, WLayoutType, ImmutAnyOrigin],
+    x_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    x_bs: Int,
+    x_cs: Int,
+    x_ls: Int,
+    w_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    w_cs: Int,
+    w_ws: Int,
     bias_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    dout: TileTensor[dtype, DoutLayoutType, ImmutAnyOrigin],
-    seq_idx: TileTensor[DType.int32, SLayoutType, ImmutAnyOrigin],
-    initial_states: TileTensor[dtype, ILayoutType, ImmutAnyOrigin],
-    dx: TileTensor[mut=True, dtype, DxLayoutType, MutAnyOrigin],
+    dout_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    dout_bs: Int,
+    dout_cs: Int,
+    dout_ls: Int,
+    seq_idx_ptr: UnsafePointer[Int32, MutAnyOrigin],
+    si_bs: Int,
+    si_ls: Int,
+    init_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    is_bs: Int,
+    is_cs: Int,
+    is_ls: Int,
+    dx_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    dx_bs: Int,
+    dx_cs: Int,
+    dx_ls: Int,
     dweight_acc_ptr: UnsafePointer[Float32, MutAnyOrigin],
     dbias_acc_ptr: UnsafePointer[Float32, MutAnyOrigin],
-    dinitial_states: TileTensor[
-        mut=True, dtype, DILayoutType, MutAnyOrigin
-    ],
-) where (
-    TileTensor[dtype, XLayoutType, ImmutAnyOrigin].flat_rank == 3
-    and TileTensor[dtype, WLayoutType, ImmutAnyOrigin].flat_rank == 2
-    and TileTensor[dtype, DoutLayoutType, ImmutAnyOrigin].flat_rank == 3
-    and TileTensor[mut=True, dtype, DxLayoutType, MutAnyOrigin].flat_rank == 3
-    and TileTensor[DType.int32, SLayoutType, ImmutAnyOrigin].flat_rank == 2
-    and TileTensor[dtype, ILayoutType, ImmutAnyOrigin].flat_rank == 3
-    and TileTensor[mut=True, dtype, DILayoutType, MutAnyOrigin].flat_rank == 3
+    dinit_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    dis_bs: Int,
+    dis_cs: Int,
+    dis_ls: Int,
 ):
-    """Causal conv1d backward, CPU path.
+    """Causal conv1d fused backward, CPU path.
 
-    With `has_seq_idx`, gates dpre, dx, and dweight contributions by
-    sequence-id equality (mirroring the forward gate). dbias's per-token
-    sum is unchanged because dpre is already zero for padding tokens.
-
-    Parallelised across (batch, channel) workers via `sync_parallelize`.
-    Workers may share a `d` (across batches) so the per-channel
-    `dweight` / `dbias` accumulators are atomic-added at the end.
+    `dweight_acc_ptr` / `dbias_acc_ptr` are dense fp32 `(dim, width)` /
+    `(dim,)` accumulators (zero-initialised by the caller); everything
+    else is arbitrarily strided. `dinitial_states` is written iff
+    `has_initial_states`. Pointers gated off by a comptime flag are
+    never dereferenced.
     """
     comptime accum_t = DType.float32
+    comptime kV = 32 // size_of[dtype]()
+
+    var n_rows = batch * dim
+    var n_tasks = min(n_rows, TASKS_PER_CORE * num_logical_cores())
+    var rows_per_task = (n_rows + n_tasks - 1) // n_tasks
 
     @parameter
-    def process_bc(bc_idx: Int):
-        var b = bc_idx // dim
-        var d = bc_idx % dim
+    def process_chunk(task_idx: Int):
+        var row_lo = task_idx * rows_per_task
+        var row_hi = min(row_lo + rows_per_task, n_rows)
+        # dpre chunk buffer, reused across rows of this task (fast path).
+        var dpre_buf = InlineArray[Float32, kChunk + width](fill=0)
+        var buf = dpre_buf.unsafe_ptr()
 
-        var bias_v: Scalar[accum_t] = 0
+        for bc_idx in range(row_lo, row_hi):
+            var b = bc_idx // dim
+            var d = bc_idx % dim
 
-        comptime if has_bias:
-            bias_v = bias_ptr[d].cast[accum_t]()
+            var x_row = x_ptr + (b * x_bs + d * x_cs)
+            var dout_row = dout_ptr + (b * dout_bs + d * dout_cs)
+            var dx_row = dx_ptr + (b * dx_bs + d * dx_cs)
+            # Only dereferenced when the matching comptime gate is on.
+            var si_row = seq_idx_ptr + b * si_bs
+            var init_row = init_ptr + (b * is_bs + d * is_cs)
+            var dinit_row = dinit_ptr + (b * dis_bs + d * dis_cs)
 
-        var weights = SIMD[accum_t, width](0)
-
-        comptime for k in range(width):
-            weights[k] = weight[d, k].cast[accum_t]()
-
-        # Sliding window: dpre_win[k] = dpre[t + k]. Prefill with dpre[0..W-1].
-        var dpre_win = SIMD[accum_t, width](0)
-
-        comptime for k in range(width):
-            dpre_win[k] = _cpu_dpre_at[
-                dtype,
-                width,
-                has_seq_idx,
-                has_initial_states,
-                apply_silu,
-                XLayoutType,
-                DoutLayoutType,
-                SLayoutType,
-                ILayoutType,
-            ](
-                k,
-                b,
-                d,
-                seqlen,
-                bias_v,
-                weights,
-                x,
-                dout,
-                seq_idx,
-                initial_states,
-            )
-
-        var local_dweight = SIMD[accum_t, width](0)
-        var local_dbias: Scalar[accum_t] = 0
-
-        # ---- initial_states-only contributions ----
-        # dpre_win[0..W-2] = dpre[0..W-2] right now (the prefill); these
-        # are exactly the dpre values that flow into dinitial_states and
-        # the "boundary" dweight terms (where the forward conv read
-        # initial_states instead of x). Compute both before the main
-        # loop slides the window away.
-        comptime if has_initial_states:
-            # dinit[i] = sum_{k=0..i} weight[k] * dpre[i - k]   for i in [0, W-1)
-            comptime for i in range(width - 1):
-                var dinit_v: Scalar[accum_t] = 0
-
-                comptime for k in range(width):
-
-                    comptime if i - k >= 0:
-                        dinit_v += weights[k] * dpre_win[i - k]
-                dinitial_states[b, d, i] = dinit_v.cast[dtype]()
-
-            # dweight[k] += sum_{t=0..W-2-k} dpre[t] * initial_states[t + k]
-            # — the part of the conv that read initial_states in the forward.
-            comptime for k in range(width):
-
-                comptime for t in range(width - 1 - k):
-                    var is_v = initial_states[b, d, t + k].cast[accum_t]()
-                    local_dweight[k] += dpre_win[t] * is_v
-
-        for t in range(seqlen):
-            var cur_id_t: Int32 = 0
-
-            comptime if has_seq_idx:
-                cur_id_t = seq_idx[b, t]
-
-            # dx[t] = sum_k weights[W-1-k] * dpre_win[k]
-            # With seq_idx: each term is gated on
-            # `seq_idx[t] == seq_idx[t+k]` (forward used x[t] in position
-            # t+k's conv only when ids matched).
-            var dx_v: Scalar[accum_t] = 0
-
-            comptime for k in range(width):
-                var include: Bool = True
-
-                comptime if has_seq_idx:
-                    var pos_k = t + k
-                    if pos_k < seqlen:
-                        var sid: Int32 = seq_idx[b, pos_k]
-                        include = sid == cur_id_t
-                    else:
-                        include = False
-                if include:
-                    dx_v += weights[width - 1 - k] * dpre_win[k]
-            dx[b, d, t] = dx_v.cast[dtype]()
-
-            # dweight[k] += dpre[t] * x[t + k - (W-1)];  dbias += dpre[t]
-            # dpre_win[0] = dpre[t]; already zero if seq_idx[t] < 0.
-            # For dweight, additionally gate on
-            # `seq_idx[src_t] == seq_idx[t]` (= cur_id_t).
-            var dpre_t: Scalar[accum_t] = dpre_win[0]
+            var bias_v: Scalar[accum_t] = 0
 
             comptime if has_bias:
-                local_dbias += dpre_t
+                bias_v = bias_ptr[d].cast[accum_t]()
+
+            var weights = SIMD[accum_t, width](0)
 
             comptime for k in range(width):
-                var src_t = t + k - (width - 1)
-                if src_t >= 0:
-                    var include: Bool = True
+                weights[k] = w_ptr[d * w_cs + k * w_ws].cast[accum_t]()
+
+            var local_dweight = SIMD[accum_t, width](0)
+            var local_dbias: Scalar[accum_t] = 0
+
+            # ---- initial_states-only contributions ----
+            # Need dpre[0..W-2]: dinit[i] = sum_{k<=i} weight[k]*dpre[i-k],
+            # and the boundary dweight terms where the forward read
+            # initial_states instead of x.
+            comptime if has_initial_states:
+                var dpre_head = SIMD[accum_t, width](0)
+
+                comptime for i in range(width - 1):
+                    dpre_head[i] = _dpre_scalar[
+                        dtype, width, has_seq_idx, has_initial_states,
+                        apply_silu,
+                    ](
+                        i, seqlen, bias_v, weights, x_row, x_ls,
+                        dout_row, dout_ls, si_row, si_ls, init_row, is_ls,
+                    )
+
+                comptime for i in range(width - 1):
+                    var dinit_v: Scalar[accum_t] = 0
+
+                    comptime for k in range(width):
+
+                        comptime if i - k >= 0:
+                            dinit_v = dpre_head[i - k].fma(
+                                weights[k], dinit_v
+                            )
+                    dinit_row[i * dis_ls] = dinit_v.cast[dtype]()
+
+                # dweight[k] += sum_{t=0..W-2-k} dpre[t]*initial_states[t+k]
+                comptime for k in range(width):
+
+                    comptime for t in range(width - 1 - k):
+                        var is_v = init_row[(t + k) * is_ls].cast[accum_t]()
+                        local_dweight[k] = dpre_head[t].fma(
+                            is_v, local_dweight[k]
+                        )
+
+            # ---- main loop over t ----
+            var fast = x_ls == 1 and dout_ls == 1 and dx_ls == 1
+
+            comptime if has_seq_idx:
+                fast = False
+
+            if fast:
+                # dweight/dbias vector partial sums; reduced at row end.
+                var dw_v = InlineArray[SIMD[accum_t, kV], width](
+                    fill=SIMD[accum_t, kV](0)
+                )
+                var db_v = SIMD[accum_t, kV](0)
+
+                var chunk_start = 0
+                while chunk_start < seqlen:
+                    var n = min(kChunk, seqlen - chunk_start)
+                    var n_ext = n + width - 1
+
+                    # -- pass A: fill dpre_buf[0..n_ext) = dpre[cs+j],
+                    #    folding dweight/dbias for j < n as we go. --
+                    var j = 0
+                    # scalar head: t < W-1 (boundary taps) — first chunk
+                    # only.
+                    while j < n and chunk_start + j < width - 1:
+                        var t = chunk_start + j
+                        var dp = _dpre_scalar[
+                            dtype, width, has_seq_idx,
+                            has_initial_states, apply_silu,
+                        ](
+                            t, seqlen, bias_v, weights, x_row, x_ls,
+                            dout_row, dout_ls, si_row, si_ls,
+                            init_row, is_ls,
+                        )
+                        buf[j] = dp
+
+                        comptime if has_bias:
+                            local_dbias += dp
+
+                        comptime for k in range(width):
+                            var src_t = t + k - (width - 1)
+                            if src_t >= 0:
+                                local_dweight[k] = dp.fma(
+                                    x_row[src_t].cast[accum_t](),
+                                    local_dweight[k],
+                                )
+                        j += 1
+
+                    # vector body over the in-chunk region [j, n).
+                    while j + kV <= n:
+                        var t = chunk_start + j
+                        var dpre_v: SIMD[accum_t, kV]
+                        # x taps stay live for the dweight fold below.
+                        var xt = InlineArray[SIMD[accum_t, kV], width](
+                            fill=SIMD[accum_t, kV](0)
+                        )
+
+                        comptime for k in range(width):
+                            xt[k] = (
+                                (x_row + (t + k - (width - 1)))
+                                .load[width=kV]()
+                                .cast[accum_t]()
+                            )
+                        var dout_v = (
+                            (dout_row + t).load[width=kV]().cast[accum_t]()
+                        )
+
+                        comptime if apply_silu:
+                            var pre = SIMD[accum_t, kV](bias_v)
+
+                            comptime for k in range(width):
+                                pre = xt[k].fma(
+                                    SIMD[accum_t, kV](weights[k]), pre
+                                )
+                            dpre_v = dout_v * _silu_grad_v[kV](pre)
+                        else:
+                            dpre_v = dout_v
+
+                        (buf + j).store(dpre_v)
+
+                        comptime if has_bias:
+                            db_v += dpre_v
+
+                        comptime for k in range(width):
+                            dw_v[k] = dpre_v.fma(xt[k], dw_v[k])
+                        j += kV
+
+                    # scalar tail of the in-chunk region [j, n): every tap
+                    # is in-range (t >= W-1 here — the scalar head ended
+                    # the boundary), so no gating needed beyond dpre's own.
+                    while j < n:
+                        var t = chunk_start + j
+                        var dp = _dpre_scalar[
+                            dtype, width, has_seq_idx,
+                            has_initial_states, apply_silu,
+                        ](
+                            t, seqlen, bias_v, weights, x_row, x_ls,
+                            dout_row, dout_ls, si_row, si_ls,
+                            init_row, is_ls,
+                        )
+                        buf[j] = dp
+
+                        comptime if has_bias:
+                            local_dbias += dp
+
+                        comptime for k in range(width):
+                            local_dweight[k] = dp.fma(
+                                x_row[t + k - (width - 1)].cast[accum_t](),
+                                local_dweight[k],
+                            )
+                        j += 1
+
+                    # extension [n, n_ext): buffer-only (next chunk's
+                    # positions; their dweight/dbias fold happens there).
+                    while j < n_ext:
+                        buf[j] = _dpre_scalar[
+                            dtype, width, has_seq_idx,
+                            has_initial_states, apply_silu,
+                        ](
+                            chunk_start + j, seqlen, bias_v, weights,
+                            x_row, x_ls, dout_row, dout_ls, si_row,
+                            si_ls, init_row, is_ls,
+                        )
+                        j += 1
+
+                    # -- pass B: dx[t] = sum_k w[W-1-k] * dpre[t+k]. --
+                    var i = 0
+                    while i + kV <= n:
+                        var acc = SIMD[accum_t, kV](0)
+
+                        comptime for k in range(width):
+                            var dpv = (buf + (i + k)).load[width=kV]()
+                            acc = dpv.fma(
+                                SIMD[accum_t, kV](weights[width - 1 - k]),
+                                acc,
+                            )
+                        (dx_row + (chunk_start + i)).store(
+                            acc.cast[dtype]()
+                        )
+                        i += kV
+                    while i < n:
+                        var acc: Scalar[accum_t] = 0
+
+                        comptime for k in range(width):
+                            acc = buf[i + k].fma(
+                                weights[width - 1 - k], acc
+                            )
+                        dx_row[chunk_start + i] = acc.cast[dtype]()
+                        i += 1
+
+                    chunk_start += n
+
+                # reduce the vector partial sums into the row totals.
+                comptime if has_bias:
+                    local_dbias += db_v.reduce_add()
+
+                comptime for k in range(width):
+                    local_dweight[k] += dw_v[k].reduce_add()
+            else:
+                # ---- scalar sliding-window fallback (seq_idx and/or
+                # non-unit strides). dpre_win[k] = dpre[t + k]. ----
+                var dpre_win = SIMD[accum_t, width](0)
+
+                comptime for k in range(width):
+                    dpre_win[k] = _dpre_scalar[
+                        dtype, width, has_seq_idx, has_initial_states,
+                        apply_silu,
+                    ](
+                        k, seqlen, bias_v, weights, x_row, x_ls,
+                        dout_row, dout_ls, si_row, si_ls, init_row, is_ls,
+                    )
+
+                for t in range(seqlen):
+                    var cur_id_t: Int32 = 0
 
                     comptime if has_seq_idx:
-                        var sid: Int32 = seq_idx[b, src_t]
-                        include = sid == cur_id_t
-                    if include:
-                        var x_v = x[b, d, src_t].cast[accum_t]()
-                        local_dweight[k] += dpre_t * x_v
+                        cur_id_t = si_row[t * si_ls]
 
-            # Slide window left, append dpre[t + W] (or 0 past seqlen).
-            comptime for k in range(width - 1):
-                dpre_win[k] = dpre_win[k + 1]
-            dpre_win[width - 1] = _cpu_dpre_at[
-                dtype,
-                width,
-                has_seq_idx,
-                has_initial_states,
-                apply_silu,
-                XLayoutType,
-                DoutLayoutType,
-                SLayoutType,
-                ILayoutType,
-            ](
-                t + width,
-                b,
-                d,
-                seqlen,
-                bias_v,
-                weights,
-                x,
-                dout,
-                seq_idx,
-                initial_states,
-            )
+                    # dx[t] = sum_k weights[W-1-k] * dpre_win[k], each
+                    # term gated on seq_idx[t] == seq_idx[t+k].
+                    var dx_v: Scalar[accum_t] = 0
 
-        # Atomic-add the (b, d) block's contribution. Multiple parallel
-        # workers may target the same `d` across different batches.
-        comptime for k in range(width):
-            _ = Atomic[DType.float32].fetch_add[ordering=Ordering.RELAXED](
-                dweight_acc_ptr + d * width + k, local_dweight[k]
-            )
+                    comptime for k in range(width):
+                        var include: Bool = True
 
-        comptime if has_bias:
-            _ = Atomic[DType.float32].fetch_add[ordering=Ordering.RELAXED](
-                dbias_acc_ptr + d, local_dbias
-            )
+                        comptime if has_seq_idx:
+                            var pos_k = t + k
+                            if pos_k < seqlen:
+                                include = si_row[pos_k * si_ls] == cur_id_t
+                            else:
+                                include = False
+                        if include:
+                            dx_v = dpre_win[k].fma(
+                                weights[width - 1 - k], dx_v
+                            )
+                    dx_row[t * dx_ls] = dx_v.cast[dtype]()
 
-    sync_parallelize[process_bc](batch * dim)
+                    # dweight[k] += dpre[t] * x[t+k-(W-1)]; dbias += dpre[t]
+                    var dpre_t: Scalar[accum_t] = dpre_win[0]
+
+                    comptime if has_bias:
+                        local_dbias += dpre_t
+
+                    comptime for k in range(width):
+                        var src_t = t + k - (width - 1)
+                        if src_t >= 0:
+                            var include: Bool = True
+
+                            comptime if has_seq_idx:
+                                include = si_row[src_t * si_ls] == cur_id_t
+                            if include:
+                                local_dweight[k] = dpre_t.fma(
+                                    x_row[src_t * x_ls].cast[accum_t](),
+                                    local_dweight[k],
+                                )
+
+                    # slide the window, append dpre[t + W] (0 past end).
+                    comptime for k in range(width - 1):
+                        dpre_win[k] = dpre_win[k + 1]
+                    dpre_win[width - 1] = _dpre_scalar[
+                        dtype, width, has_seq_idx, has_initial_states,
+                        apply_silu,
+                    ](
+                        t + width, seqlen, bias_v, weights, x_row, x_ls,
+                        dout_row, dout_ls, si_row, si_ls, init_row, is_ls,
+                    )
+
+            # Atomic-add the (b, d) row's contribution: workers may share
+            # a `d` across batches.
+            comptime for k in range(width):
+                _ = Atomic[DType.float32].fetch_add[ordering=Ordering.RELAXED](
+                    dweight_acc_ptr + d * width + k, local_dweight[k]
+                )
+
+            comptime if has_bias:
+                _ = Atomic[DType.float32].fetch_add[ordering=Ordering.RELAXED](
+                    dbias_acc_ptr + d, local_dbias
+                )
+
+    sync_parallelize[process_chunk](n_tasks)

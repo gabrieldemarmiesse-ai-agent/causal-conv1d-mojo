@@ -1,15 +1,19 @@
 """Static per-config variant entry point for causal_conv1d_bwd_full_cpu.
 
+All comptime params (dtype, width, has_bias, …) come from `-D` defines
+set by `_jit.py`, so we compile only the variant the caller actually
+needs.
+
 Runtime args tuple (32 positionals) is built in
-``bwd_full_cpu/__init__.py``; comptime values come from `-D` defines.
+``bwd_full_cpu/__init__.py``. The kernel takes raw pointers + element
+strides (no TileTensor): the CPU hot loop indexes rows manually so the
+vector fast path can issue unaligned SIMD loads along t.
 """
 
 from std.os import abort
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 from std.sys import get_defined_bool, get_defined_dtype, get_defined_int
-from layout import TileTensor, Idx
-from layout.tile_layout import Layout
 
 from kernel import bwd_kernel_cpu
 
@@ -35,28 +39,28 @@ def causal_conv1d_bwd_full_cpu_variant(
     var batch_int = Int(py=args[7])
     var dim_int = Int(py=args[8])
     var seqlen_int = Int(py=args[9])
-    var x_b_stride = UInt32(py=args[10])
-    var x_c_stride = UInt32(py=args[11])
-    var x_l_stride = UInt32(py=args[12])
-    var w_c_stride = UInt32(py=args[13])
-    var w_w_stride = UInt32(py=args[14])
-    var dout_b_stride = UInt32(py=args[15])
-    var dout_c_stride = UInt32(py=args[16])
-    var dout_l_stride = UInt32(py=args[17])
-    var dx_b_stride = UInt32(py=args[18])
-    var dx_c_stride = UInt32(py=args[19])
-    var dx_l_stride = UInt32(py=args[20])
+    var x_b_stride = Int(py=args[10])
+    var x_c_stride = Int(py=args[11])
+    var x_l_stride = Int(py=args[12])
+    var w_c_stride = Int(py=args[13])
+    var w_w_stride = Int(py=args[14])
+    var dout_b_stride = Int(py=args[15])
+    var dout_c_stride = Int(py=args[16])
+    var dout_l_stride = Int(py=args[17])
+    var dx_b_stride = Int(py=args[18])
+    var dx_c_stride = Int(py=args[19])
+    var dx_l_stride = Int(py=args[20])
     var seq_idx_addr = Int(py=args[21])
-    var seq_idx_b_stride = UInt32(py=args[22])
-    var seq_idx_l_stride = UInt32(py=args[23])
+    var seq_idx_b_stride = Int(py=args[22])
+    var seq_idx_l_stride = Int(py=args[23])
     var initial_states_addr = Int(py=args[24])
-    var initial_states_b_stride = UInt32(py=args[25])
-    var initial_states_c_stride = UInt32(py=args[26])
-    var initial_states_l_stride = UInt32(py=args[27])
+    var initial_states_b_stride = Int(py=args[25])
+    var initial_states_c_stride = Int(py=args[26])
+    var initial_states_l_stride = Int(py=args[27])
     var dinitial_states_addr = Int(py=args[28])
-    var dinitial_states_b_stride = UInt32(py=args[29])
-    var dinitial_states_c_stride = UInt32(py=args[30])
-    var dinitial_states_l_stride = UInt32(py=args[31])
+    var dinitial_states_b_stride = Int(py=args[29])
+    var dinitial_states_c_stride = Int(py=args[30])
+    var dinitial_states_l_stride = Int(py=args[31])
 
     if batch_int == 0 or dim_int == 0 or seqlen_int == 0:
         return PythonObject(None)
@@ -92,63 +96,6 @@ def causal_conv1d_bwd_full_cpu_variant(
         unsafe_from_address=dbias_acc_addr
     )
 
-    var x_tt = TileTensor(
-        x_ptr,
-        Layout(
-            (batch_int, dim_int, seqlen_int),
-            (x_b_stride, x_c_stride, x_l_stride),
-        ),
-    )
-    var w_tt = TileTensor(
-        w_ptr,
-        Layout(
-            (dim_int, Idx[WIDTH]),
-            (w_c_stride, w_w_stride),
-        ),
-    )
-    var dout_tt = TileTensor(
-        dout_ptr,
-        Layout(
-            (batch_int, dim_int, seqlen_int),
-            (dout_b_stride, dout_c_stride, dout_l_stride),
-        ),
-    )
-    var dx_tt = TileTensor(
-        dx_ptr,
-        Layout(
-            (batch_int, dim_int, seqlen_int),
-            (dx_b_stride, dx_c_stride, dx_l_stride),
-        ),
-    )
-    var seq_idx_tt = TileTensor(
-        seq_idx_ptr,
-        Layout(
-            (batch_int, seqlen_int),
-            (seq_idx_b_stride, seq_idx_l_stride),
-        ),
-    )
-    var initial_states_tt = TileTensor(
-        initial_states_ptr,
-        Layout(
-            (batch_int, dim_int, Idx[WIDTH - 1]),
-            (
-                initial_states_b_stride,
-                initial_states_c_stride,
-                initial_states_l_stride,
-            ),
-        ),
-    )
-    var dinitial_states_tt = TileTensor(
-        dinitial_states_ptr,
-        Layout(
-            (batch_int, dim_int, Idx[WIDTH - 1]),
-            (
-                dinitial_states_b_stride,
-                dinitial_states_c_stride,
-                dinitial_states_l_stride,
-            ),
-        ),
-    )
     bwd_kernel_cpu[
         DTYPE,
         WIDTH,
@@ -156,27 +103,39 @@ def causal_conv1d_bwd_full_cpu_variant(
         HAS_SEQ_IDX,
         HAS_INITIAL_STATES,
         APPLY_SILU,
-        type_of(x_tt).LayoutType,
-        type_of(w_tt).LayoutType,
-        type_of(dout_tt).LayoutType,
-        type_of(dx_tt).LayoutType,
-        type_of(seq_idx_tt).LayoutType,
-        type_of(initial_states_tt).LayoutType,
-        type_of(dinitial_states_tt).LayoutType,
     ](
         batch_int,
         dim_int,
         seqlen_int,
-        x_tt.as_immut(),
-        w_tt.as_immut(),
+        x_ptr,
+        x_b_stride,
+        x_c_stride,
+        x_l_stride,
+        w_ptr,
+        w_c_stride,
+        w_w_stride,
         b_ptr,
-        dout_tt.as_immut(),
-        seq_idx_tt.as_immut(),
-        initial_states_tt.as_immut(),
-        dx_tt,
+        dout_ptr,
+        dout_b_stride,
+        dout_c_stride,
+        dout_l_stride,
+        seq_idx_ptr,
+        seq_idx_b_stride,
+        seq_idx_l_stride,
+        initial_states_ptr,
+        initial_states_b_stride,
+        initial_states_c_stride,
+        initial_states_l_stride,
+        dx_ptr,
+        dx_b_stride,
+        dx_c_stride,
+        dx_l_stride,
         dweight_acc_ptr,
         dbias_acc_ptr,
-        dinitial_states_tt,
+        dinitial_states_ptr,
+        dinitial_states_b_stride,
+        dinitial_states_c_stride,
+        dinitial_states_l_stride,
     )
     return PythonObject(None)
 

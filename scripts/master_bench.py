@@ -16,59 +16,76 @@ instrument Mojo's ``DeviceContext``, CPU has no GPU asm, …):
 
     a. lock clocks                          cuda: nvidia-smi · rocm: rocm-smi
                                             metal: induced GPU perf state (xctrace) ·
-                                            cpu: n/a (skip)
+                                            cpu: linux governor (best-effort) /
+                                            darwin: n/a (skip)
     b. clear our JIT cache, recompile, correctness suite (quick/full tiers)
     c. kernel-time bench vs baseline        cuda: vs upstream (gate) ·
-                                            rocm/cpu: vs pytorch-ref (report) ·
-                                            metal: absolute GPU time (xctrace)
+                                            rocm: vs pytorch-ref (report) ·
+                                            metal: absolute GPU time (xctrace),
+                                            canary + ratchet gate ·
+                                            cpu: per-call kernel time vs
+                                            pytorch-ref (report), canary +
+                                            ratchet gate
     d. deep profiler                        cuda: ncu · metal: xctrace stats ·
-                                            cpu: perf stat · rocm: n/a (skip)
+                                            cpu: perf stat (linux) / sample
+                                            (darwin) · rocm: n/a (skip)
     e. dump GPU asm                         cuda: PTX/SASS · rocm: GCN ISA ·
                                             metal/cpu: n/a (skip)
     f. instruction-mix histogram vs upstream            cuda only (else skip)
     g. ptxas -v spill / regalloc canary                 cuda only (else skip)
     h. independent torch.utils.benchmark (walltime) run
 
-┌────────────────┬────────────────────┬────────────────────────────┬───────────────────────┬─────────────────────┐
-│     phase      │        cuda        │            rocm            │         metal         │         cpu         │
-├────────────────┼────────────────────┼────────────────────────────┼───────────────────────┼─────────────────────┤
-│ a lock         │ nvidia-smi (gate)  │ rocm-smi perflevel (gate)  │ induced state (gate)  │ skip                │
-├────────────────┼────────────────────┼────────────────────────────┼───────────────────────┼─────────────────────┤
-│ b correctness  │ -k cuda +nvidia    │ -k cuda +rocm              │ -k mps                │ -k cpu              │
-├────────────────┼────────────────────┼────────────────────────────┼───────────────────────┼─────────────────────┤
-│ c bench        │ vs upstream (gate) │ vs pytorch (report)        │ absolute xctrace time │ walltime vs pytorch │
-├────────────────┼────────────────────┼────────────────────────────┼───────────────────────┼─────────────────────┤
-│ d profiler     │ ncu                │ skip (rocprof breaks Mojo) │ xctrace stats         │ perf stat           │
-├────────────────┼────────────────────┼────────────────────────────┼───────────────────────┼─────────────────────┤
-│ e asm          │ PTX/SASS           │ GCN ISA                    │ skip (no textual ISA) │ skip                │
-├────────────────┼────────────────────┼────────────────────────────┼───────────────────────┼─────────────────────┤
-│ f/g hist+spill │ yes                │ skip                       │ skip                  │ skip                │
-├────────────────┼────────────────────┼────────────────────────────┼───────────────────────┼─────────────────────┤
-│ h walltime     │ yes                │ yes                        │ yes                   │ yes                 │
-└────────────────┴────────────────────┴────────────────────────────┴───────────────────────┴─────────────────────┘
+┌────────────────┬────────────────────┬────────────────────────────┬───────────────────────┬───────────────────────┐
+│     phase      │        cuda        │            rocm            │         metal         │          cpu          │
+├────────────────┼────────────────────┼────────────────────────────┼───────────────────────┼───────────────────────┤
+│ a lock         │ nvidia-smi (gate)  │ rocm-smi perflevel (gate)  │ induced state (gate)  │ linux: governor       │
+│                │                    │                            │                       │ darwin: skip          │
+├────────────────┼────────────────────┼────────────────────────────┼───────────────────────┼───────────────────────┤
+│ b correctness  │ -k cuda +nvidia    │ -k cuda +rocm              │ -k mps                │ -k cpu                │
+├────────────────┼────────────────────┼────────────────────────────┼───────────────────────┼───────────────────────┤
+│ c bench        │ vs upstream (gate) │ vs pytorch (report)        │ absolute xctrace time │ kernel time vs        │
+│                │                    │                            │ canary+ratchet (gate) │ pytorch (report) +    │
+│                │                    │                            │                       │ canary+ratchet (gate) │
+├────────────────┼────────────────────┼────────────────────────────┼───────────────────────┼───────────────────────┤
+│ d profiler     │ ncu                │ skip (rocprof breaks Mojo) │ xctrace stats         │ perf stat / sample    │
+├────────────────┼────────────────────┼────────────────────────────┼───────────────────────┼───────────────────────┤
+│ e asm          │ PTX/SASS           │ GCN ISA                    │ skip (no textual ISA) │ skip                  │
+├────────────────┼────────────────────┼────────────────────────────┼───────────────────────┼───────────────────────┤
+│ f/g hist+spill │ yes                │ skip                       │ skip                  │ skip                  │
+├────────────────┼────────────────────┼────────────────────────────┼───────────────────────┼───────────────────────┤
+│ h walltime     │ yes                │ yes                        │ yes                   │ yes                   │
+└────────────────┴────────────────────┴────────────────────────────┴───────────────────────┴───────────────────────┘
 
 Backend selection is automatic (NVIDIA via ``nvidia-smi``, AMD via
 ``rocminfo``/``rocm-smi``, Apple via ``sys.platform``, else CPU); override
 with ``--backend``.
 
 The kernel-time baseline differs by backend: only NVIDIA has Tri Dao's
-hand-tuned CUDA kernels to diff against, so only NVIDIA's step (c) is a true
-perf *gate* (regression => non-zero exit). ROCm/CPU report mojo's speedup
-over the pure-PyTorch fallback (informational); Apple reports absolute
-per-kernel GPU time read back from a Metal System Trace (there is no
-upstream to diff against — upstream is CUDA-only).
+hand-tuned CUDA kernels to diff against, so only NVIDIA's step (c) gates
+on a *ratio*. ROCm/CPU report mojo's speedup over the pure-PyTorch
+fallback (informational); Apple reports absolute per-kernel GPU time read
+back from a Metal System Trace (there is no upstream to diff against —
+upstream is CUDA-only). Metal and CPU additionally gate two ways with no
+external baseline needed: a one-call output canary (all-zero/non-finite
+result fails — timing can't see silently-wrong output) and a ratcheting
+per-shape regression gate against this machine's own best recorded time
+(``scripts/baselines/{metal_kernel_gpu_time,cpu_kernel_time}.json``,
+gitignored; ``--refresh-baseline`` reseeds after an intentional change).
 
 Apple has no public clock-lock API/CLI; step (a) instead reproduces
 Instruments' GUI-only "Induced GPU Performance State = Maximum" setting by
 binary-patching a copy of its Metal System Trace template (see
 ``scripts/_apple_gpu_clock_lock.py``).
 
-Step (a) is a hard gate everywhere: an unlocked GPU makes measurements
-across runs incomparable, which defeats the point of a perf gate feeding
-an agentic loop. A failed lock (no passwordless sudo, or — Apple only — a
-future Xcode update breaking the patch) exits non-zero rather than
-silently continuing unlocked; ``--no-lock`` is the explicit opt-out for
-local dev loops.
+Step (a) is a hard gate on every GPU backend: an unlocked GPU makes
+measurements across runs incomparable, which defeats the point of a perf
+gate feeding an agentic loop. A failed lock (no passwordless sudo, or —
+Apple only — a future Xcode update breaking the patch) exits non-zero
+rather than silently continuing unlocked; ``--no-lock`` is the explicit
+opt-out for local dev loops. On cpu the lock is best-effort instead (the
+Linux cpufreq governor when passwordless sudo allows it; macOS has no
+userspace CPU-DVFS control at all), so a failed lock warns and continues
+— the cpu ratchet tolerance is sized for that extra noise.
 
 Steps c/d/h are separate processes on purpose — torch.profiler,
 torch.utils.benchmark, and ncu must not share a run.
@@ -177,6 +194,11 @@ class Backend:
     baseline: str | None = None  # ratio baseline impl, or None for absolute
     gate_ratio: bool = False  # does a slow ratio FAIL the gate?
     kernel_measure: str = "kernel"  # _bench.py --measure for step (c)
+    # Ratcheting per-shape regression gate against this machine's own best
+    # recorded kernel time (the metal-style gate; see _Ratchet). None = no
+    # ratchet. Used where no hand-tuned baseline exists to gate a ratio on.
+    ratchet_file: str | None = None
+    ratchet_tolerance: float = 1.10
 
 
 # --------------------------------------------------------------------------
@@ -345,13 +367,34 @@ def _make_metal_backend() -> Backend:
     )
 
 
+def _cpu_pretty() -> str:
+    """Host-CPU brand for the banner / AGENT-SUMMARY ('Apple M4', 'Intel(R)
+    Xeon(R) ...'). platform.processor() alone is uselessly generic on darwin
+    ('arm')."""
+    if sys.platform == "darwin":
+        brand = _sysctl("machdep.cpu.brand_string")
+        if brand:
+            return brand
+    else:
+        try:
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.lower().startswith("model name"):
+                        return line.split(":", 1)[1].strip()
+        except OSError:
+            pass
+    return platform.processor() or platform.machine() or "CPU"
+
+
 def _make_cpu_backend() -> Backend:
-    # No CUDA events on CPU, so torch.profiler kernel-time is empty; step (c)
-    # falls back to wall-clock. We report mojo's speedup over the pytorch
-    # fallback (informational, not a gate).
+    # No CUDA events on CPU, so _bench.py's `--measure kernel` times the
+    # synchronous kernel call directly (median per-call wall time). The
+    # mojo-vs-pytorch ratio is informational (the pytorch fallback is not a
+    # hand-tuned baseline); regressions are caught the metal way instead:
+    # output canary + ratchet vs this machine's own best per-shape time.
     return Backend(
         name="cpu",
-        pretty=platform.processor() or platform.machine() or "CPU",
+        pretty=_cpu_pretty(),
         arch="",
         device="cpu",
         test_device="cpu",
@@ -359,7 +402,12 @@ def _make_cpu_backend() -> Backend:
         walltime_impls=("mojo", "pytorch"),
         baseline="pytorch",
         gate_ratio=False,
-        kernel_measure="walltime",
+        kernel_measure="kernel",
+        ratchet_file="cpu_kernel_time.json",
+        # Looser than metal's 1.10: there is no CPU clock lock on darwin, so
+        # scheduler/DVFS noise is part of the distribution the ratchet's
+        # best-ever baseline sits at the fast edge of.
+        ratchet_tolerance=1.25,
     )
 
 
@@ -410,9 +458,7 @@ def lock_clocks(be: Backend, enabled: bool) -> tuple[str, bool]:
         return _lock_rocm()
     if be.name == "metal":
         return _lock_metal()
-    # CPU has no GPU clock to lock.
-    warn(f"no headless clock lock on {be.name}; running UNLOCKED.")
-    return "unlocked", False
+    return _lock_cpu()
 
 
 def _fatal_lock_failure(reason: str) -> NoReturn:
@@ -489,6 +535,51 @@ def _lock_metal() -> tuple[str, bool]:
     )
 
 
+# Governor the Linux cpu lock replaced, so unlock_clocks can restore it.
+_CPU_PREV_GOVERNOR: str | None = None
+
+_CPUFREQ_GLOB = "/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"
+
+
+def _lock_cpu() -> tuple[str, bool]:
+    """Best-effort CPU-frequency lock. NOT a hard gate, unlike the GPU
+    backends: macOS has no userspace CPU-DVFS control at all, and requiring
+    passwordless sudo for the fallback backend would be disproportionate —
+    the cpu ratchet tolerance is sized for the extra noise instead."""
+    global _CPU_PREV_GOVERNOR
+    if sys.platform == "darwin":
+        warn("no CPU clock lock on macOS (no userspace DVFS control); UNLOCKED.")
+        return "unlocked", False
+    import glob  # noqa: PLC0415
+
+    paths = glob.glob(_CPUFREQ_GLOB)
+    if not paths:
+        warn("no cpufreq sysfs interface; running UNLOCKED.")
+        return "unlocked", False
+    try:
+        current = Path(paths[0]).read_text().strip()
+    except OSError:
+        current = ""
+    if current == "performance":
+        print("cpufreq governor already 'performance'")
+        return "performance", False  # nothing to restore on exit
+    r = subprocess.run(
+        ["sudo", "-n", "tee", *paths],
+        input="performance",
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode == 0:
+        _CPU_PREV_GOVERNOR = current or "schedutil"
+        print(
+            f"cpufreq governor -> 'performance' (was {_CPU_PREV_GOVERNOR!r}; "
+            "restored on exit)"
+        )
+        return "performance", True
+    warn("cpufreq governor lock needs passwordless sudo; running UNLOCKED.")
+    return "unlocked", False
+
+
 def unlock_clocks(be: Backend) -> None:
     if be.name == "cuda":
         for args in (["--reset-gpu-clocks"], ["--reset-memory-clocks"]):
@@ -496,6 +587,15 @@ def unlock_clocks(be: Backend) -> None:
     elif be.name == "rocm":
         subprocess.run(
             ["sudo", "-n", "rocm-smi", "--setperflevel", "auto"], capture_output=True
+        )
+    elif be.name == "cpu" and _CPU_PREV_GOVERNOR:
+        import glob  # noqa: PLC0415
+
+        subprocess.run(
+            ["sudo", "-n", "tee", *glob.glob(_CPUFREQ_GLOB)],
+            input=_CPU_PREV_GOVERNOR,
+            capture_output=True,
+            text=True,
         )
 
 
@@ -523,7 +623,12 @@ def _smoke_k(dev: str) -> str:
 def correctness(be: Backend, tier: str, clean: bool) -> bool:
     section(f"(b) recompile + correctness ({tier} tier, {be.name})")
     if clean:
-        cache = Path("~/.cache/causal_conv1d_mojo").expanduser()
+        # Same resolution order as _jit_common.py's _CACHE_HOME — honoring
+        # XDG_CACHE_HOME here too, or "recompile" silently cleans the wrong
+        # directory when it is set.
+        cache_home = os.environ.get("XDG_CACHE_HOME")
+        cache_root = Path(cache_home) if cache_home else Path("~/.cache").expanduser()
+        cache = cache_root / "causal_conv1d_mojo"
         if VERBOSE:
             print(f"clearing JIT cache {cache} (keeping mojo compiler cache)")
         # Keep xctrace_templates/: step (a) just wrote the clock-locked
@@ -569,10 +674,15 @@ def correctness(be: Backend, tier: str, clean: bool) -> bool:
 
 
 def bench_kernel(
-    be: Backend, fn, dtype, shapes, runs, clock, baseline_flags, metal_refresh=False
+    be: Backend, fn, dtype, shapes, runs, clock, baseline_flags, ratchet_refresh=False
 ) -> list:
     measure = be.kernel_measure
-    label = "GPU kernel time" if measure == "kernel" else "wall-clock"
+    if measure != "kernel":
+        label = "wall-clock"
+    elif be.name == "cpu":
+        label = "per-call CPU kernel time"
+    else:
+        label = "GPU kernel time"
     if be.name == "metal":
         section("(c) absolute GPU kernel time (xctrace Metal System Trace)")
     elif be.baseline:
@@ -618,15 +728,15 @@ def bench_kernel(
         except json.JSONDecodeError:
             Gate.fail(f"bench produced no JSON on {shape}")
     if be.baseline is None:
-        # NOTE: deliberately NOT derived from baseline_flags — that list
-        # carries --refresh-baseline on every --full run to re-measure the
-        # CUDA upstream/pytorch caches, but reseeding the metal ratchet on
-        # every FULL run would mean the authoritative tier can never fail
-        # its own regression gate. Only an explicit --refresh-baseline
-        # reseeds the metal baseline.
-        _aggregate_absolute(reps, refresh=metal_refresh)
+        # NOTE: ratchet_refresh is deliberately NOT derived from
+        # baseline_flags — that list carries --refresh-baseline on every
+        # --full run to re-measure the upstream/pytorch caches, but
+        # reseeding a ratchet (metal or cpu) on every FULL run would mean
+        # the authoritative tier can never fail its own regression gate.
+        # Only an explicit --refresh-baseline reseeds a ratchet.
+        _aggregate_absolute(reps, refresh=ratchet_refresh)
     else:
-        _aggregate_ratio(be, reps)
+        _aggregate_ratio(be, reps, ratchet_refresh=ratchet_refresh)
     return reps
 
 
@@ -655,9 +765,7 @@ def _print_roofline(rows: list[dict]) -> None:
         else " (no peak known for this device — set CAUSAL_CONV1D_PEAK_GBPS)"
     )
     print(f"\n  memory roofline{peak_note}:")
-    print(
-        f"  {'shape':>21} | {'moved':>9} | {'achieved':>11} | {'%peak':>6} | regime"
-    )
+    print(f"  {'shape':>21} | {'moved':>9} | {'achieved':>11} | {'%peak':>6} | regime")
     print("  " + "-" * 72)
     hints = []
     for r in have:
@@ -676,27 +784,43 @@ def _print_roofline(rows: list[dict]) -> None:
         print(f"    {shape}: {hint}")
 
 
+def _num(v):
+    """None out NaN/±inf: a failed timing serializes as ``min_us: NaN``,
+    and json.dumps would re-emit the non-standard ``NaN`` token inside the
+    AGENT-SUMMARY block, breaking strict parsers (jq, JSON.parse) exactly
+    on the runs where per-shape detail matters most."""
+    return v if isinstance(v, (int, float)) and math.isfinite(v) else None
+
+
 def _agent_row(r: dict) -> dict:
     """Compact, machine-readable per-shape record for the AGENT-SUMMARY."""
     rl = r.get("roofline") or {}
     hl = (r.get("metal_analysis") or {}).get("headline") or {}
-    kus = hl.get("median_us") or r["results"].get("mojo", {}).get("min_us")
+    kus = _num(hl.get("median_us")) or _num(r["results"].get("mojo", {}).get("min_us"))
     return {
         "fn": r["fn"],
         "shape": r["shape"],
         "dtype": r["config"].get("dtype"),
         "channel_last": r["config"].get("channel_last", False),
         "kernel_us": round(kus, 2) if kus else None,
-        "achieved_gbps": rl.get("achieved_gbps"),
-        "pct_peak": rl.get("pct_peak"),
+        "achieved_gbps": _num(rl.get("achieved_gbps")),
+        "pct_peak": _num(rl.get("pct_peak")),
         "regime": rl.get("regime"),
         "hint": rl.get("hint"),
-        "ratio_over_upstream": r["ratio_min"].get("mojo_over_upstream"),
+        "ratio_over_upstream": _num(r["ratio_min"].get("mojo_over_upstream")),
+        # rocm/cpu diff against the pure-PyTorch fallback instead; surface
+        # that ratio too so their AGENT-SUMMARY rows aren't ratio-less.
+        "ratio_over_pytorch": _num(r["ratio_min"].get("mojo_over_pytorch")),
     }
 
 
-def _aggregate_ratio(be: Backend, rows: list[dict]) -> None:
-    """mojo-vs-baseline table. Gates (fails) only when ``be.gate_ratio``."""
+def _aggregate_ratio(
+    be: Backend, rows: list[dict], *, ratchet_refresh: bool = False
+) -> None:
+    """mojo-vs-baseline table. The ratio gates (fails) only when
+    ``be.gate_ratio``; backends with ``be.ratchet_file`` (cpu) additionally
+    gate the metal way — output canary + ratchet vs this machine's own best
+    per-shape time — since their pytorch ratio is informational only."""
     if not rows:
         Gate.fail("no parseable bench results")
         return
@@ -768,20 +892,48 @@ def _aggregate_ratio(be: Backend, rows: list[dict]) -> None:
         # No hand-tuned baseline here — the ratio is mojo-vs-naive-fallback,
         # reported for context, not gated.
         print(f"  worst mojo/{base} ratio: {worst:.3f}x  (informational, not a gate)")
+
+    # Canary + ratchet (cpu): the pytorch ratio above can't gate — the
+    # fallback is not a tuned baseline — so regressions are caught the metal
+    # way: a corrupt output fails outright, and a healthy time is gated
+    # against this machine's own best recorded per-shape time.
+    ratchet = (
+        _Ratchet(REPO / "scripts" / "baselines" / be.ratchet_file, be.ratchet_tolerance)
+        if be.ratchet_file
+        else None
+    )
+    for r in rows:
+        canary = r.get("canary", "ok")
+        us = r["results"].get("mojo", {}).get("min_us", math.nan)
+        if canary != "ok":
+            # A corrupt run must not seed or ratchet the baseline: a
+            # silently-wrong kernel can do less work and time *faster*
+            # than a healthy one, poisoning the ratchet low forever.
+            Gate.fail(f"output canary on {_shape_label(r)}: {canary}")
+        elif ratchet is not None and us == us:
+            note = ratchet.check(
+                r, us, refresh=ratchet_refresh, what=f"{be.name} kernel"
+            )
+            print(f"  ratchet {_shape_label(r):>21}: {us:9.2f} us — {note}")
+    if ratchet is not None:
+        ratchet.save()
     _print_roofline(rows)
 
 
-# No external reference exists on Apple (upstream is CUDA-only), so the
-# regression gate ratchets against this machine's own best history:
-# per-(fn, shape, dtype, config, gpu, clock) medians persisted here.
+# No external reference exists on Apple (upstream is CUDA-only) nor a tuned
+# one on CPU (pytorch is a naive fallback), so those regression gates ratchet
+# against this machine's own best history: per-(fn, shape, dtype, config,
+# gpu, clock) times persisted under scripts/baselines/ (gitignored).
 _METAL_BASELINE = REPO / "scripts" / "baselines" / "metal_kernel_gpu_time.json"
 # Looser than CUDA's 3%-vs-upstream: even clock-locked medians scatter a
 # few % run-to-run on Apple, and the baseline is a best-ever ratchet
 # (always at the fast edge of the distribution), so give real headroom.
+# (The cpu ratchet is looser still — Backend.ratchet_tolerance — since
+# there is no clock lock on darwin at all.)
 _METAL_GATE_TOLERANCE = 1.10
 
 
-def _metal_baseline_key(r: dict) -> str:
+def _baseline_key(r: dict) -> str:
     cfg = {k: v for k, v in sorted((r.get("config") or {}).items())}
     env = r.get("env") or {}
     return json.dumps(
@@ -797,6 +949,76 @@ def _metal_baseline_key(r: dict) -> str:
         },
         sort_keys=True,
     )
+
+
+class _Ratchet:
+    """Per-shape best-time regression gate persisted in a JSON baseline.
+
+    A time over ``best * tolerance`` fails the gate; a faster time lowers
+    the baseline (ratchets down). ``refresh=True`` (an explicit
+    --refresh-baseline only — NOT --full, which must be able to fail its
+    own gate) reseeds unconditionally — use it when an intentional change
+    lands. Callers must keep corrupt runs (failed canary, NaN timing,
+    throttled clock) away from ``check`` — see the canary comments at the
+    call sites.
+    """
+
+    def __init__(self, path: Path, tolerance: float):
+        self.path = path
+        self.tolerance = tolerance
+        self.data: dict = {}
+        try:
+            data = json.loads(path.read_text())
+            if isinstance(data, dict):
+                self.data = data
+            else:
+                warn(f"baseline {path.name} is not a JSON object — starting fresh")
+        except FileNotFoundError:
+            pass  # first run on this machine
+        except (OSError, json.JSONDecodeError) as e:
+            # A truncated/corrupt baseline must not silently become "no
+            # baseline" — that would re-establish at the *current* time and
+            # ratchet in whatever regression is present right now.
+            warn(
+                f"baseline {path.name} unreadable ({e.__class__.__name__}: {e})"
+                " — starting fresh; previous per-shape bests are lost"
+            )
+        self.dirty = False
+
+    def check(self, r: dict, us: float, *, refresh: bool, what: str) -> str:
+        """Gate ``us`` for this row; returns a short note for the table."""
+        key = _baseline_key(r)
+        prev = self.data.get(key)
+        if prev is not None and not isinstance(prev, (int, float)):
+            warn(f"baseline entry for {key} is not a number — re-establishing")
+            prev = None
+        if refresh or prev is None:
+            self.data[key] = us
+            self.dirty = True
+            return "baseline reseeded" if refresh else "baseline established"
+        if us > prev * self.tolerance:
+            Gate.fail(
+                f"{what} regression on {_shape_label(r)}: {us:.2f} us vs "
+                f"baseline {prev:.2f} us "
+                f"(>{(self.tolerance - 1) * 100:.0f}% over; "
+                f"--refresh-baseline to accept)"
+            )
+            return f"REGRESSION vs best {prev:.2f} us"
+        if us < prev:
+            self.data[key] = us
+            self.dirty = True
+            return f"new best (was {prev:.2f} us)"
+        return f"within tolerance of best {prev:.2f} us"
+
+    def save(self) -> None:
+        if self.dirty:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # Write-then-rename so a run killed mid-save can't truncate the
+            # baseline (os.replace is atomic on POSIX).
+            tmp = self.path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self.data, indent=1, sort_keys=True))
+            tmp.replace(self.path)
+            print(f"  (baseline updated: {self.path.relative_to(REPO)})")
 
 
 def _aggregate_absolute(rows: list[dict], *, refresh: bool = False) -> None:
@@ -816,11 +1038,7 @@ def _aggregate_absolute(rows: list[dict], *, refresh: bool = False) -> None:
     if not rows:
         Gate.fail("no parseable bench results")
         return
-    try:
-        baseline = json.loads(_METAL_BASELINE.read_text())
-    except (OSError, json.JSONDecodeError):
-        baseline = {}
-    baseline_dirty = False
+    ratchet = _Ratchet(_METAL_BASELINE, _METAL_GATE_TOLERANCE)
 
     print(f"\n  {'shape':>21} | {'kernel us':>10} | {'clock':>8} | {'duty%':>6} | note")
     print("  " + "-" * 70)
@@ -858,34 +1076,15 @@ def _aggregate_absolute(rows: list[dict], *, refresh: bool = False) -> None:
             note = (note + "; " if note else "") + "inconclusive (clock != Maximum)"
             warn(f"{_shape_label(r)}: clock {clock!r}, not Maximum — skipping gate")
         else:
-            key = _metal_baseline_key(r)
-            prev = baseline.get(key)
-            if refresh or prev is None:
-                if prev is None and not refresh:
-                    note = (note + "; " if note else "") + "baseline established"
-                baseline[key] = us
-                baseline_dirty = True
-            elif us > prev * _METAL_GATE_TOLERANCE:
-                Gate.fail(
-                    f"metal kernel regression on {_shape_label(r)}: "
-                    f"{us:.2f} us vs baseline {prev:.2f} us "
-                    f"(>{(_METAL_GATE_TOLERANCE - 1) * 100:.0f}% over; "
-                    f"--refresh-baseline to accept)"
-                )
-            elif us < prev:
-                baseline[key] = us  # ratchet down
-                baseline_dirty = True
+            rnote = ratchet.check(r, us, refresh=refresh, what="metal kernel")
+            note = (note + "; " if note else "") + rnote
 
         print(
-            f"  {_shape_label(r):>21} | {us:10.2f} | {clock:>8} | "
-            f"{duty:6.1f} | {note}"
+            f"  {_shape_label(r):>21} | {us:10.2f} | {clock:>8} | {duty:6.1f} | {note}"
         )
     print("  " + "-" * 70)
     print("  absolute GPU time (mojo-only; upstream is CUDA-only — nothing to diff)")
-    if baseline_dirty:
-        _METAL_BASELINE.parent.mkdir(parents=True, exist_ok=True)
-        _METAL_BASELINE.write_text(json.dumps(baseline, indent=1, sort_keys=True))
-        print(f"  (baseline updated: {_METAL_BASELINE.relative_to(REPO)})")
+    ratchet.save()
     _print_roofline(rows)
 
 
@@ -915,7 +1114,7 @@ def profiler(be: Backend, fn, dtype, canon, skip_flag, reps) -> None:
     elif be.name == "metal":
         _profiler_metal(reps)
     elif be.name == "cpu":
-        _profiler_perf(be, fn, dtype, canon)
+        _profiler_perf(be, fn, dtype, canon, reps)
     else:  # rocm
         skip(
             "(d) deep profiler",
@@ -1087,15 +1286,8 @@ def _profiler_metal(reps: list[dict]) -> None:
     )
 
 
-def _profiler_perf(be: Backend, fn, dtype, canon) -> None:
-    section("(d) perf stat (CPU hardware counters)")
-    if not shutil.which("perf"):
-        print("skipped — `perf` not found (linux perf tools); CPU has no GPU profiler.")
-        return
-    cmd = [
-        "perf",
-        "stat",
-        "-d",
+def _cpu_workload_argv(fn, dtype, canon, *, iters: int) -> list[str]:
+    return [
         sys.executable,
         str(REPO / "scripts" / "_bench.py"),
         fn,
@@ -1110,12 +1302,104 @@ def _profiler_perf(be: Backend, fn, dtype, canon) -> None:
         "--measure",
         "raw",
         "--iters",
-        "30",
+        str(iters),
         "--warmup",
         "10",
     ]
+
+
+def _profiler_perf(be: Backend, fn, dtype, canon, reps) -> None:
+    if sys.platform == "darwin":
+        _profiler_sample(fn, dtype, canon, reps)
+        return
+    section("(d) perf stat (CPU hardware counters)")
+    if not shutil.which("perf"):
+        print("skipped — `perf` not found (linux perf tools); CPU has no GPU profiler.")
+        return
+    cmd = ["perf", "stat", "-d", *_cpu_workload_argv(fn, dtype, canon, iters=30)]
     if run(cmd).returncode != 0:
         warn("perf stat run failed (perf_event_paranoid? needs relaxed perms)")
+
+
+def _profiler_sample(fn, dtype, canon, reps) -> None:
+    """darwin: time profile of the bench loop via /usr/bin/sample.
+
+    There is no `perf` on macOS; `sample` gives the same actionable signal
+    a deep CPU profile is for — *where* the time goes (the Mojo kernel vs
+    Python marshalling vs torch prep vs the parallel runtime). We size the
+    workload off the step-(c) kernel time so the loop runs long enough to
+    straddle the sampling window, sample the child mid-loop, and print the
+    top-of-stack leaf counts (the hot functions).
+    """
+    section("(d) sample (darwin CPU time profile)")
+    if not shutil.which("sample"):
+        print("skipped — /usr/bin/sample not found.")
+        return
+    # Per-call µs for the canon shape from step (c) — the workload below
+    # runs canon, so the sizing must come from canon's rep, not whatever
+    # shape happens to be first in `reps`. Fall back to a guess.
+    canon_shape = [int(s) for s in canon.split(",")]
+    per_call = next(
+        (
+            r["results"]["mojo"]["min_us"]
+            for r in reps
+            if r.get("shape") == canon_shape
+            and r.get("results", {}).get("mojo", {}).get("runs_us")
+        ),
+        5_000.0,
+    )
+    startup_s, sample_s = 10.0, 5.0
+    budget_s = startup_s + sample_s + 10.0  # generous: import + warmup + loop
+    iters = max(50, int(budget_s * 1e6 / max(per_call, 1.0)))
+    child = subprocess.Popen(
+        _cpu_workload_argv(fn, dtype, canon, iters=iters),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        # Let torch import + JIT-cache warmup finish so samples land in the
+        # timed loop, not interpreter startup.
+        try:
+            child.wait(timeout=startup_s)
+            warn("workload exited before sampling began — nothing to profile")
+            return
+        except subprocess.TimeoutExpired:
+            pass  # still running, as intended
+        out = REPO / "scripts" / "baselines" / f"sample_{fn}_cpu.txt"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        r = run(
+            [
+                "sample",
+                str(child.pid),
+                str(int(sample_s)),
+                "1",  # 1 ms sampling interval
+                "-mayDie",
+                "-file",
+                str(out),
+            ],
+            capture=True,
+        )
+        if r.returncode != 0:
+            warn(f"sample failed: {(r.stderr or '').strip()[-200:]}")
+            return
+        text = out.read_text()
+        # The actionable part: leaf-function sample counts ("Sort by top of
+        # stack"); the full call tree stays in the file for a deeper look.
+        marker = "Sort by top of stack"
+        idx = text.find(marker)
+        if idx >= 0:
+            lines = [ln for ln in text[idx:].splitlines() if ln.strip()][:18]
+            print("\n".join(f"  {ln}" for ln in lines))
+        else:
+            print("  (no 'Sort by top of stack' section in sample output)")
+        print(f"  full call tree: {out.relative_to(REPO)}")
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
 
 
 # --------------------------------------------------------------------------
@@ -1148,8 +1432,13 @@ def _assembly_metal(fn) -> None:
     the kernel's metallib in ~/.cache/modular for the tool to find."""
     section("(e/f/g) Metal kernel introspection (static facts + AIR mix)")
     r = run(
-        [sys.executable, str(REPO / "scripts" / "_metal_introspect.py"),
-         "--fn", fn, "--json"],
+        [
+            sys.executable,
+            str(REPO / "scripts" / "_metal_introspect.py"),
+            "--fn",
+            fn,
+            "--json",
+        ],
         capture=True,
     )
     line = (r.stdout or "").strip().splitlines()
@@ -1507,7 +1796,7 @@ def main() -> int:
                 kruns,
                 clock,
                 baseline_flags,
-                metal_refresh=args.refresh_baseline,
+                ratchet_refresh=args.refresh_baseline,
             )
             agent_rows.extend(_agent_row(r) for r in reps)
             profiler(be, fn, dtype, sh["canon"], args.skip_ncu, reps)

@@ -6,15 +6,16 @@ params (dtype, width, has_bias, …) come from `-D` defines set by
 
 Runtime args tuple (22 positionals) is built in
 ``fwd_cpu/__init__.py``; it carries only runtime-varying values —
-comptime values are baked into the `.so` via `-D`.
+comptime values are baked into the `.so` via `-D`. The kernel takes
+raw pointers + element strides (no TileTensor): the CPU hot loop
+indexes rows manually so the vector fast path can issue unaligned
+SIMD loads along t.
 """
 
 from std.os import abort
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 from std.sys import get_defined_bool, get_defined_dtype, get_defined_int
-from layout import TileTensor, Idx
-from layout.tile_layout import Layout
 
 from kernel import fwd_kernel_cpu
 
@@ -37,21 +38,21 @@ def causal_conv1d_fwd_cpu_variant(
     var batch_int = Int(py=args[4])
     var dim_int = Int(py=args[5])
     var seqlen_int = Int(py=args[6])
-    var x_b_stride = UInt32(py=args[7])
-    var x_c_stride = UInt32(py=args[8])
-    var x_l_stride = UInt32(py=args[9])
-    var w_c_stride = UInt32(py=args[10])
-    var w_w_stride = UInt32(py=args[11])
-    var o_b_stride = UInt32(py=args[12])
-    var o_c_stride = UInt32(py=args[13])
-    var o_l_stride = UInt32(py=args[14])
+    var x_b_stride = Int(py=args[7])
+    var x_c_stride = Int(py=args[8])
+    var x_l_stride = Int(py=args[9])
+    var w_c_stride = Int(py=args[10])
+    var w_w_stride = Int(py=args[11])
+    var o_b_stride = Int(py=args[12])
+    var o_c_stride = Int(py=args[13])
+    var o_l_stride = Int(py=args[14])
     var seq_idx_addr = Int(py=args[15])
-    var seq_idx_b_stride = UInt32(py=args[16])
-    var seq_idx_l_stride = UInt32(py=args[17])
+    var seq_idx_b_stride = Int(py=args[16])
+    var seq_idx_l_stride = Int(py=args[17])
     var initial_states_addr = Int(py=args[18])
-    var initial_states_b_stride = UInt32(py=args[19])
-    var initial_states_c_stride = UInt32(py=args[20])
-    var initial_states_l_stride = UInt32(py=args[21])
+    var initial_states_b_stride = Int(py=args[19])
+    var initial_states_c_stride = Int(py=args[20])
+    var initial_states_l_stride = Int(py=args[21])
 
     if batch_int == 0 or dim_int == 0 or seqlen_int == 0:
         return PythonObject(None)
@@ -75,45 +76,6 @@ def causal_conv1d_fwd_cpu_variant(
         unsafe_from_address=o_addr
     )
 
-    var x_tt = TileTensor(
-        x_ptr,
-        Layout(
-            (batch_int, dim_int, seqlen_int),
-            (x_b_stride, x_c_stride, x_l_stride),
-        ),
-    )
-    var w_tt = TileTensor(
-        w_ptr,
-        Layout(
-            (dim_int, Idx[WIDTH]),
-            (w_c_stride, w_w_stride),
-        ),
-    )
-    var o_tt = TileTensor(
-        o_ptr,
-        Layout(
-            (batch_int, dim_int, seqlen_int),
-            (o_b_stride, o_c_stride, o_l_stride),
-        ),
-    )
-    var seq_idx_tt = TileTensor(
-        seq_idx_ptr,
-        Layout(
-            (batch_int, seqlen_int),
-            (seq_idx_b_stride, seq_idx_l_stride),
-        ),
-    )
-    var initial_states_tt = TileTensor(
-        initial_states_ptr,
-        Layout(
-            (batch_int, dim_int, Idx[WIDTH - 1]),
-            (
-                initial_states_b_stride,
-                initial_states_c_stride,
-                initial_states_l_stride,
-            ),
-        ),
-    )
     fwd_kernel_cpu[
         DTYPE,
         WIDTH,
@@ -121,21 +83,29 @@ def causal_conv1d_fwd_cpu_variant(
         HAS_SEQ_IDX,
         HAS_INITIAL_STATES,
         APPLY_SILU,
-        type_of(x_tt).LayoutType,
-        type_of(w_tt).LayoutType,
-        type_of(o_tt).LayoutType,
-        type_of(seq_idx_tt).LayoutType,
-        type_of(initial_states_tt).LayoutType,
     ](
         batch_int,
         dim_int,
         seqlen_int,
-        x_tt.as_immut(),
-        w_tt.as_immut(),
+        x_ptr,
+        x_b_stride,
+        x_c_stride,
+        x_l_stride,
+        w_ptr,
+        w_c_stride,
+        w_w_stride,
         b_ptr,
-        seq_idx_tt.as_immut(),
-        initial_states_tt.as_immut(),
-        o_tt,
+        seq_idx_ptr,
+        seq_idx_b_stride,
+        seq_idx_l_stride,
+        initial_states_ptr,
+        initial_states_b_stride,
+        initial_states_c_stride,
+        initial_states_l_stride,
+        o_ptr,
+        o_b_stride,
+        o_c_stride,
+        o_l_stride,
     )
     return PythonObject(None)
 

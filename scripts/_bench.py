@@ -6,7 +6,10 @@ shape, every function-argument flag, against every implementation
 
   * ``--measure kernel``   — per-kernel GPU time via ``torch.profiler``
                              (CUPTI). The headline "GPU kernel time vs
-                             upstream" signal.
+                             upstream" signal. On ``--device cpu`` there
+                             are no device events, so this is the median
+                             per-call wall time of the synchronous kernel
+                             call (plus an output canary in the JSON).
   * ``--measure walltime`` — end-to-end wall-clock via
                              ``torch.utils.benchmark`` (auto CPU<->GPU
                              sync). Captures Python + launch overhead.
@@ -127,18 +130,41 @@ def _mac_chip() -> str:
     On Apple silicon the GPU is integrated, so the CPU brand identifies the
     GPU too. Falls back to a generic tag if sysctl is unavailable.
     """
-    try:
-        out = subprocess.run(
-            ["sysctl", "-n", "machdep.cpu.brand_string"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if out.returncode == 0 and out.stdout.strip():
-            return f"mps:{out.stdout.strip()}"
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return "mps"
+    brand = _cpu_brand()
+    return f"mps:{brand}" if brand else "mps"
+
+
+def _cpu_brand() -> str:
+    """Best-effort host-CPU brand string ('Apple M4', 'Intel(R) Xeon(R) ...').
+
+    Used on darwin for the mps env signature (the SoC brand identifies the
+    integrated GPU) and on device=cpu for the cpu env signature — a core
+    count alone would let two different CPU models share baseline-cache
+    entries, and could never match the `_PEAK_GBPS` roofline table.
+    """
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                return out.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.lower().startswith("model name"):
+                        return line.split(":", 1)[1].strip()
+        except OSError:
+            pass
+    import platform  # noqa: PLC0415
+
+    return platform.processor() or platform.machine() or ""
 
 
 # Set in the child process that `xctrace --launch`es as the traced workload,
@@ -390,7 +416,7 @@ def _bwd_callable(impl: str, cfg: Config) -> Callable[[], Any]:
 
     use_seq_idx = cfg.has_seq_idx and impl != "pytorch"
 
-    if cfg.device == "mps":
+    if cfg.device in ("mps", "cpu"):
         # Apple trace path: Mojo doesn't label its Metal encoders, so a
         # fwd+bwd-per-call closure would collapse both kernels' Compute
         # encoders into one trace group, blending two kernels' times. Build
@@ -398,6 +424,11 @@ def _bwd_callable(impl: str, cfg: Config) -> Callable[[], Any]:
         # torch.autograd.grad, not .backward(), so no AccumulateGrad nodes
         # fire and add stray elementwise kernels). This leaves the traced
         # Compute Command attributable to the bwd kernel.
+        #
+        # cpu takes the same closure for the same reason: its kernel-time
+        # measure is the whole synchronous call, so a fwd+bwd closure would
+        # blend the fwd kernel into the "bwd" number (and skew its roofline,
+        # whose byte count is bwd-only traffic).
         x_ = t["x"].detach().requires_grad_()
         w_ = t["weight"].detach().requires_grad_()
         b_ = t["bias"].detach().requires_grad_() if t["bias"] is not None else None
@@ -412,7 +443,7 @@ def _bwd_callable(impl: str, cfg: Config) -> Callable[[], Any]:
         inputs = [v for v in (x_, w_, b_) if v is not None]
         return lambda: torch.autograd.grad(out, inputs, dout, retain_graph=True)
 
-    # cuda/cpu: rebuild the graph each call and run the full fwd+bwd. The
+    # cuda: rebuild the graph each call and run the full fwd+bwd. The
     # profiler classifier isolates the bwd kernel by name, so blending the
     # fwd kernel into the same call is harmless here.
     def call():
@@ -490,7 +521,15 @@ def measure_kernel(
     """Mean per-call GPU time (µs) of the kernels matched by `classify`.
 
     `classify is None` sums every CUDA event (the pure-PyTorch path).
+
+    On cpu there are no device events to attribute (torch.profiler would
+    report 0.0 and the Mojo CPU kernel isn't a torch op anyway), so the
+    kernel time IS the synchronous call: per-call wall time, median over
+    `iters` (robust to scheduler blips). It includes the Python argument
+    marshalling — inherent per-call cost on the CPU path.
     """
+    if device == "cpu":
+        return _measure_kernel_cpu(call, iters=iters, warmup=warmup)
     from torch.profiler import ProfilerActivity, profile  # noqa: PLC0415
 
     sync = _sync(device)
@@ -511,6 +550,18 @@ def measure_kernel(
         if classify is None or classify(evt.name):
             total += evt.self_device_time_total
     return total / iters
+
+
+def _measure_kernel_cpu(call: Callable[[], Any], *, iters: int, warmup: int) -> float:
+    """Median per-call wall time (µs) of a synchronous CPU kernel call."""
+    for _ in range(warmup):
+        call()
+    durs_ns = []
+    for _ in range(iters):
+        t0 = time.perf_counter_ns()
+        call()
+        durs_ns.append(time.perf_counter_ns() - t0)
+    return statistics.median(durs_ns) / 1e3
 
 
 def measure_walltime(
@@ -1096,9 +1147,7 @@ def run_metal_kernel(cfg: Config, args, env_sig: dict, tag: str) -> dict:
             f"(Metal System Trace) -> {trace} ==="
         )
         _record_trace(child, trace)
-        analysis, headline_durs = _summarize_trace(
-            trace, expected_iters=args.iters
-        )
+        analysis, headline_durs = _summarize_trace(trace, expected_iters=args.iters)
         last_analysis = analysis
         if analysis.get("note"):
             other_notes.append(analysis["note"])
@@ -1116,15 +1165,12 @@ def run_metal_kernel(cfg: Config, args, env_sig: dict, tag: str) -> dict:
     # surface any note raised by ANY recording (throttling, undercounts).
     cross = sorted(set(other_notes) - {analysis.get("note", "")})
     if cross:
-        merged = "; ".join(
-            filter(None, [analysis.get("note", ""), *cross])
-        )
+        merged = "; ".join(filter(None, [analysis.get("note", ""), *cross]))
         analysis["note"] = f"{merged} (some recordings)"
     if 0 < len(run_medians) < n_recs:
         analysis["note"] = (
-            (analysis.get("note", "") + "; " if analysis.get("note") else "")
-            + f"only {len(run_medians)}/{n_recs} recordings parsed"
-        )
+            analysis.get("note", "") + "; " if analysis.get("note") else ""
+        ) + f"only {len(run_medians)}/{n_recs} recordings parsed"
 
     # Keep the best recording's .trace for Instruments; the rest are
     # tens-to-hundreds of MB each and already reduced to numbers.
@@ -1175,7 +1221,11 @@ def _env_signature(args, device: str) -> dict[str, str]:
     elif device == "mps":
         gpu = _mac_chip()
     else:
-        gpu = f"cpu:{os.cpu_count()}"
+        # Brand, not just core count: two CPU models with equal counts must
+        # not share baseline-cache entries, and the brand is what the
+        # roofline peak-BW table matches on ("Apple M4" etc.).
+        brand = _cpu_brand()
+        gpu = f"cpu:{brand} x{os.cpu_count()}" if brand else f"cpu:{os.cpu_count()}"
     # The master script passes the locked clock (MHz) so the cache key
     # tracks the measurement environment; "unlocked" otherwise.
     return {"gpu": gpu, "clock": args.clock_locked or "unlocked"}
@@ -1187,6 +1237,8 @@ def run(args) -> dict:
         raise SystemExit("CUDA device required for --device cuda")
     if device == "mps" and not torch.backends.mps.is_available():
         raise SystemExit("MPS (Apple GPU) device required for --device mps")
+    if args.dtype is None:
+        args.dtype = "fp32" if device == "cpu" else "fp16"
 
     shape = _parse_shape(args.shape, args.fn, args.width)
     if args.fn in ("fwd", "bwd"):
@@ -1264,7 +1316,20 @@ def run(args) -> dict:
         if cache is not None and is_baseline:
             cache.put_runs(impl, shape, cfg.as_dict(), m.runs_us)
 
-    return _assemble_report(cfg, args, env_sig, tag, results)
+    rep = _assemble_report(cfg, args, env_sig, tag, results)
+    # cpu kernel-time runs carry the same output canary the metal path has:
+    # timing alone can't see a kernel that silently produced garbage, and
+    # master_bench's cpu ratchet gate must never seed its baseline off a
+    # corrupt (and therefore possibly fast) run.
+    if (
+        device == "cpu"
+        and args.measure == "kernel"
+        and all(cfg.shape)  # canary reduces over outputs; skip empty shapes
+        and results.get("mojo") is not None
+        and results["mojo"].runs_us
+    ):
+        rep["canary"] = _canary_check(make_callable("mojo", cfg)())
+    return rep
 
 
 def _measure_impl(impl: str, cfg: Config, args) -> Measurement:
@@ -1307,6 +1372,10 @@ def _measure_impl(impl: str, cfg: Config, args) -> Measurement:
 # agent whether a shape has any bandwidth headroom left. Extend as needed;
 # CAUSAL_CONV1D_PEAK_GBPS overrides, and an unknown device omits %-of-peak
 # (reporting achieved GB/s only) rather than inventing a denominator.
+# On Apple the same entries serve device=cpu too (the env-sig gpu string is
+# `cpu:Apple M4 ...`): unified memory means the SoC DRAM peak is the true
+# upper bound for the CPU cluster as well. x86 CPUs have no entries — the
+# roofline prints achieved GB/s and the env-override hint instead.
 _PEAK_GBPS = {
     "Apple M4 Max": 546.0,
     "Apple M4 Pro": 273.0,
@@ -1356,8 +1425,9 @@ def _bytes_moved(cfg: Config) -> int:
     if cfg.fn in ("fwd", "bwd"):
         B, D, L = cfg.shape[0], cfg.shape[1], cfg.shape[2]
         elems = (
-            3 * B * D * L if cfg.fn == "bwd"  # read x + dout, write dx
-            else 2 * B * D * L                # read x, write out
+            3 * B * D * L
+            if cfg.fn == "bwd"  # read x + dout, write dx
+            else 2 * B * D * L  # read x, write out
         )
         elems += D * w + (D if cfg.has_bias else 0)  # weight + bias (small)
         return elems * b
@@ -1381,6 +1451,7 @@ def _roofline(cfg: Config, kernel_us: float, gpu: str) -> dict:
         r["floor_us"] = round(nbytes / peak / 1e3, 2)
         if r.get("achieved_gbps"):
             r["pct_peak"] = round(100.0 * r["achieved_gbps"] / peak, 1)
+    is_cpu = gpu.startswith("cpu")
     pct = r.get("pct_peak")
     if pct is None:
         r["regime"] = "unknown"
@@ -1400,14 +1471,20 @@ def _roofline(cfg: Config, kernel_us: float, gpu: str) -> dict:
     elif pct < 40:
         r["regime"] = "dispatch/latency-bound"
         r["hint"] = (
-            "far below roofline — amortize per-call launch/sync overhead "
+            "far below roofline — amortize per-call dispatch overhead "
+            "(bigger/batched work), not the bandwidth path"
+            if is_cpu
+            else "far below roofline — amortize per-call launch/sync overhead "
             "(bigger/batched work), not the bandwidth path"
         )
     else:
         r["regime"] = "partial"
         r["hint"] = (
-            f"{pct:.0f}% of peak — some headroom; check the AIR instruction mix "
-            "(_metal_introspect.py) and access pattern"
+            f"{pct:.0f}% of peak — some headroom; check SIMD vectorization, "
+            "thread scaling, and the access pattern"
+            if is_cpu
+            else f"{pct:.0f}% of peak — some headroom; check the AIR instruction "
+            "mix (_metal_introspect.py) and access pattern"
         )
     return r
 
@@ -1621,7 +1698,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--shape",
         help="B,D,L,W for fwd/bwd (W optional, use --width); B,D for update",
     )
-    p.add_argument("--dtype", choices=tuple(_DTYPES), default="fp16")
+    p.add_argument(
+        "--dtype",
+        choices=tuple(_DTYPES),
+        default=None,
+        help="default: fp16 on a GPU device, fp32 on cpu (torch has no cpu "
+        "fp16 conv1d for the pytorch baseline)",
+    )
     p.add_argument(
         "--device",
         choices=("auto", "cuda", "mps", "cpu"),
