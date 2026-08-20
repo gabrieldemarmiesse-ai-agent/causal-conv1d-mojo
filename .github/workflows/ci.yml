@@ -39,6 +39,7 @@ jobs:
           - tests/test_bwd.py
           - tests/test_fwd.py
           - tests/test_imports.py
+          - tests/test_seq_idx_initial_states.py
           - tests/test_update.py
           - tests/test_varlen.py
     steps:
