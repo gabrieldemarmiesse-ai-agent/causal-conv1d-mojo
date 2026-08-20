@@ -20,8 +20,9 @@ def native_bwd_full(
     dbias_acc: torch.Tensor | None,
     dinitial_states: torch.Tensor | None,
     apply_silu: bool,
+    deterministic: bool,
 ) -> None:
-    # 39-tuple expected by the JIT-generated variant entry point.
+    # 41-tuple expected by the JIT-generated variant entry point.
     # Each unique runtime config lazily compiles its own single-variant
     # `.so` on first use, then caches it under
     # `$XDG_CACHE_HOME/causal_conv1d_mojo/bwd_full/`.
@@ -69,6 +70,7 @@ def native_bwd_full(
             dinitial_states.stride(1) if dinitial_states is not None else 0,
             dinitial_states.stride(2) if dinitial_states is not None else 0,
             1,  # use_external_stream: CUDA path wraps torch's stream
+            int(deterministic),
         )
     )
 
@@ -85,6 +87,7 @@ def native_bwd_full_mps(
     dbias_acc: torch.Tensor | None,
     dinitial_states: torch.Tensor | None,
     apply_silu: bool,
+    deterministic: bool,
 ) -> None:
     """Mac/MPS path — see `fwd/__init__.py::native_fwd_mps` for the
     rationale (torch MPS data_ptr is an Obj-C MTLBuffer pointer; we
@@ -151,6 +154,7 @@ def native_bwd_full_mps(
             dinitial_states.stride(1) if dinitial_states is not None else 0,
             dinitial_states.stride(2) if dinitial_states is not None else 0,
             0,  # use_external_stream: Metal path enqueues on ctx
+            int(deterministic),
         ),
         pre_dispatch=_pre_dispatch,
     )

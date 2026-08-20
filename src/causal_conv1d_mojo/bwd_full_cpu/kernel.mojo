@@ -36,7 +36,9 @@ path (same recurrence, one dpre window in registers).
 Parallelised over (batch*dim) rows dealt to at most
 `8 * num_logical_cores()` contiguous row-chunks (see fwd_cpu). Workers
 may share a `d` across batches, so per-row dweight/dbias partials are
-flushed with relaxed atomics.
+flushed with relaxed atomics by default. Deterministic variants instead
+plain-store each row's partial into a private batch-major fp32 workspace;
+Python reduces it over batch in a fixed order.
 """
 
 from std.algorithm import sync_parallelize
@@ -143,6 +145,7 @@ def bwd_kernel_cpu[
     has_seq_idx: Bool,
     has_initial_states: Bool,
     apply_silu: Bool,
+    deterministic: Bool,
 ](
     batch: Int,
     dim: Int,
@@ -179,11 +182,13 @@ def bwd_kernel_cpu[
 ):
     """Causal conv1d fused backward, CPU path.
 
-    `dweight_acc_ptr` / `dbias_acc_ptr` are dense fp32 `(dim, width)` /
-    `(dim,)` accumulators (zero-initialised by the caller); everything
-    else is arbitrarily strided. `dinitial_states` is written iff
-    `has_initial_states`. Pointers gated off by a comptime flag are
-    never dereferenced.
+    With `deterministic=False`, `dweight_acc_ptr` / `dbias_acc_ptr` are
+    dense fp32 `(dim, width)` / `(dim,)` accumulators zero-initialised by
+    the caller. With `deterministic=True`, they are dense batch-major
+    `(batch, dim, width)` / `(batch, dim)` workspaces whose row-private
+    slots are written with plain stores. Everything else is arbitrarily
+    strided. `dinitial_states` is written iff `has_initial_states`.
+    Pointers gated off by a comptime flag are never dereferenced.
     """
     comptime accum_t = DType.float32
     comptime kV = 32 // size_of[dtype]()
@@ -505,16 +510,27 @@ def bwd_kernel_cpu[
                         dout_row, dout_ls, si_row, si_ls, init_row, is_ls,
                     )
 
-            # Atomic-add the (b, d) row's contribution: workers may share
-            # a `d` across batches.
-            comptime for k in range(width):
-                _ = Atomic[DType.float32].fetch_add[ordering=Ordering.RELAXED](
-                    dweight_acc_ptr + d * width + k, local_dweight[k]
-                )
+            # Workers may share a `d` across batches. Deterministic rows
+            # own `(b, d)` workspace slots; the default path accumulates
+            # into the shared per-channel tensors with relaxed atomics.
+            comptime if deterministic:
+                var workspace_row = b * dim + d
 
-            comptime if has_bias:
-                _ = Atomic[DType.float32].fetch_add[ordering=Ordering.RELAXED](
-                    dbias_acc_ptr + d, local_dbias
-                )
+                comptime for k in range(width):
+                    dweight_acc_ptr[workspace_row * width + k] = local_dweight[k]
+
+                comptime if has_bias:
+                    dbias_acc_ptr[workspace_row] = local_dbias
+            else:
+
+                comptime for k in range(width):
+                    _ = Atomic[DType.float32].fetch_add[ordering=Ordering.RELAXED](
+                        dweight_acc_ptr + d * width + k, local_dweight[k]
+                    )
+
+                comptime if has_bias:
+                    _ = Atomic[DType.float32].fetch_add[ordering=Ordering.RELAXED](
+                        dbias_acc_ptr + d, local_dbias
+                    )
 
     sync_parallelize[process_chunk](n_tasks)

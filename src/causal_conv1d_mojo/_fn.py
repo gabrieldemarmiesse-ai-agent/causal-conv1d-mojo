@@ -9,9 +9,18 @@ the CPU kernels otherwise; `bias` may be None on either path.
 `W-1` cols of `[initial_states, x]` (or of `x` left zero-padded when
 there are no initial states and `seqlen < W-1`); the backward adds
 `dfinal_states` into the matching slices of `dx` and `dinitial_states`.
+
+Backward follows upstream's deterministic-mode rule on every call:
+`CAUSAL_CONV1D_DETERMINISTIC=1` enables it, `=0` disables it, and an
+unset/other value falls back to
+`torch.are_deterministic_algorithms_enabled()`. Deterministic variants
+write per-batch fp32 weight/bias partials for a fixed-order `.sum(0)`
+instead of using across-batch float atomics.
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 
@@ -27,6 +36,21 @@ from causal_conv1d_mojo.reference import causal_conv1d_ref
 # Apple GPUs. Empirically (Apple M4, fp16): mojo is ~0.3× pyTorch at
 # B*D*L=2M and ~1.4× at 8M. 4M is the conservative crossover.
 _MPS_FWD_FALLBACK_THRESHOLD = 4 * 1024 * 1024
+
+
+def _use_deterministic_mode() -> bool:
+    """Return upstream-compatible backward determinism for this call.
+
+    The explicit ``CAUSAL_CONV1D_DETERMINISTIC=1`` / ``=0`` values
+    override PyTorch's process-wide deterministic-algorithms setting;
+    unset and unrecognised values defer to PyTorch.
+    """
+    env = os.getenv("CAUSAL_CONV1D_DETERMINISTIC")
+    if env == "1":
+        return True
+    if env == "0":
+        return False
+    return torch.are_deterministic_algorithms_enabled()
 
 
 def _write_final_states(
@@ -147,6 +171,7 @@ def _bwd_full_inplace_impl(
     dbias_acc: torch.Tensor | None,
     dinitial_states: torch.Tensor | None,
     apply_silu: bool,
+    deterministic: bool,
 ) -> None:
     if x.is_cuda:
         native_bwd_full(
@@ -161,6 +186,7 @@ def _bwd_full_inplace_impl(
             dbias_acc,
             dinitial_states,
             apply_silu,
+            deterministic,
         )
     elif x.device.type == "mps":
         native_bwd_full_mps(
@@ -175,6 +201,7 @@ def _bwd_full_inplace_impl(
             dbias_acc,
             dinitial_states,
             apply_silu,
+            deterministic,
         )
     else:
         native_bwd_full_cpu(
@@ -189,6 +216,7 @@ def _bwd_full_inplace_impl(
             dbias_acc,
             dinitial_states,
             apply_silu,
+            deterministic,
         )
 
 
@@ -204,6 +232,7 @@ def _bwd_full_inplace_fake(
     dbias_acc: torch.Tensor | None,
     dinitial_states: torch.Tensor | None,
     apply_silu: bool,
+    deterministic: bool,
 ) -> None:
     return None
 
@@ -231,7 +260,9 @@ class _CausalConv1dFn(torch.autograd.Function):
     when there are no initial states and seqlen < W-1). The backward
     adds `dfinal_states` into the corresponding slices of `dx` and, for
     the part of the window that reached into the previous state,
-    `dinitial_states`.
+    `dinitial_states`. When deterministic mode is active, dweight/dbias
+    are reduced from private `(batch, dim, ...)` fp32 workspace rows
+    rather than accumulated with across-batch atomics.
     """
 
     @staticmethod
@@ -285,19 +316,32 @@ class _CausalConv1dFn(torch.autograd.Function):
         apply_silu = ctx.apply_silu
         has_bias = ctx.has_bias
         D, W = weight.shape
+        batch = x.shape[0]
         seqlen = x.shape[-1]
+        deterministic = _use_deterministic_mode()
 
         if dout.stride(-1) != 1:
             dout = dout.contiguous()
 
         dx = torch.empty_like(x)
-        # Per-block dweight/dbias contributions are atomic-added in fp32
-        # to avoid losing mantissa bits across batches. dbias_acc only
-        # allocated when there's a bias to differentiate.
-        dweight_acc = torch.zeros(D, W, dtype=torch.float32, device=x.device)
-        dbias_acc = (
-            torch.zeros(D, dtype=torch.float32, device=x.device) if has_bias else None
-        )
+        # Default variants atomic-add block/row partials into shared fp32
+        # accumulators. Deterministic variants plain-store into private
+        # batch-major fp32 rows, which are zero-filled so early-return
+        # edges (zero batch/dim/seqlen) still reduce to exact zeros.
+        if deterministic:
+            dweight_acc = torch.zeros(batch, D, W, dtype=torch.float32, device=x.device)
+            dbias_acc = (
+                torch.zeros(batch, D, dtype=torch.float32, device=x.device)
+                if has_bias
+                else None
+            )
+        else:
+            dweight_acc = torch.zeros(D, W, dtype=torch.float32, device=x.device)
+            dbias_acc = (
+                torch.zeros(D, dtype=torch.float32, device=x.device)
+                if has_bias
+                else None
+            )
         # Always allocate dinitial_states when initial_states is set —
         # the kernel writes it unconditionally to keep the dispatch lean
         # (one comptime flag instead of two). We only return it when the
@@ -325,7 +369,15 @@ class _CausalConv1dFn(torch.autograd.Function):
             dbias_acc,
             dinitial_states,
             apply_silu,
+            deterministic,
         )
+
+        if deterministic:
+            # Mirrors upstream: torch's batch reduction has a fixed order,
+            # replacing the scheduler-dependent across-batch atomic order.
+            dweight_acc = dweight_acc.sum(0)
+            if dbias_acc is not None:
+                dbias_acc = dbias_acc.sum(0)
 
         if dfinal_states is not None:
             # final_states = cat([initial_states, x])[..., -(W-1):]: the

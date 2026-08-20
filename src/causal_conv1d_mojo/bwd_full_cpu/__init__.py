@@ -20,6 +20,7 @@ def native_bwd_full_cpu(
     dbias_acc: torch.Tensor | None,
     dinitial_states: torch.Tensor | None,
     apply_silu: bool,
+    deterministic: bool,
 ) -> None:
     config = (
         _DTYPE_CODE[x.dtype],
@@ -28,6 +29,7 @@ def native_bwd_full_cpu(
         seq_idx is not None,  # has_seq_idx
         initial_states is not None,  # has_initial_states
         bool(apply_silu),
+        bool(deterministic),
     )
     runtime_args = (
         x.data_ptr(),
