@@ -40,6 +40,7 @@ jobs:
           - tests/test_fwd.py
           - tests/test_imports.py
           - tests/test_update.py
+          - tests/test_varlen.py
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
