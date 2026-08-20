@@ -37,6 +37,7 @@ jobs:
       matrix:
         test_file:
           - tests/test_bwd.py
+          - tests/test_determinism.py
           - tests/test_fwd.py
           - tests/test_imports.py
           - tests/test_seq_idx_initial_states.py
