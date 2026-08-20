@@ -25,6 +25,10 @@ The buffer extends `W-1` past the chunk (recomputed next chunk) so
 pass B never crosses a chunk seam; positions past seqlen buffer as 0.
 The first `W-1` positions of the row are handled scalar (history
 reaches initial_states / zeros), as is the last partial vector.
+When seq_idx and initial_states are both present, the virtual initial
+positions carry `seq_idx[b, 0]`; pre recomputation, boundary dweight,
+and dinitial_states all apply that id gate so later packed sequences
+cannot consume or differentiate the state.
 
 Rows with seq_idx or non-unit strides take the scalar sliding-window
 path (same recurrence, one dpre window in registers).
@@ -114,11 +118,20 @@ def _dpre_scalar[
 
             comptime if has_initial_states:
                 var is_idx: Int = src_t + (width - 1)
-                pre = (
-                    init_row[is_idx * is_ls]
-                    .cast[DType.float32]()
-                    .fma(weights[k], pre)
-                )
+
+                comptime if has_seq_idx:
+                    if si_row[0] == cur_id:
+                        pre = (
+                            init_row[is_idx * is_ls]
+                            .cast[DType.float32]()
+                            .fma(weights[k], pre)
+                        )
+                else:
+                    pre = (
+                        init_row[is_idx * is_ls]
+                        .cast[DType.float32]()
+                        .fma(weights[k], pre)
+                    )
     var dout_v = dout_row[t * dout_ls].cast[DType.float32]()
     return dout_v * _silu_grad_v[1](pre)
 
@@ -212,10 +225,12 @@ def bwd_kernel_cpu[
             var local_dweight = SIMD[accum_t, width](0)
             var local_dbias: Scalar[accum_t] = 0
 
-            # ---- initial_states-only contributions ----
+            # ---- initial_states contributions ----
             # Need dpre[0..W-2]: dinit[i] = sum_{k<=i} weight[k]*dpre[i-k],
             # and the boundary dweight terms where the forward read
-            # initial_states instead of x.
+            # initial_states instead of x. With seq_idx, both terms are
+            # gated against seq_idx[b, 0], matching the virtual ids used
+            # by forward even when the first fragment is shorter than W-1.
             comptime if has_initial_states:
                 var dpre_head = SIMD[accum_t, width](0)
 
@@ -234,9 +249,17 @@ def bwd_kernel_cpu[
                     comptime for k in range(width):
 
                         comptime if i - k >= 0:
-                            dinit_v = dpre_head[i - k].fma(
-                                weights[k], dinit_v
-                            )
+
+                            comptime if has_seq_idx:
+                                if i - k < seqlen:
+                                    if si_row[(i - k) * si_ls] == si_row[0]:
+                                        dinit_v = dpre_head[i - k].fma(
+                                            weights[k], dinit_v
+                                        )
+                            else:
+                                dinit_v = dpre_head[i - k].fma(
+                                    weights[k], dinit_v
+                                )
                     dinit_row[i * dis_ls] = dinit_v.cast[dtype]()
 
                 # dweight[k] += sum_{t=0..W-2-k} dpre[t]*initial_states[t+k]
@@ -244,9 +267,17 @@ def bwd_kernel_cpu[
 
                     comptime for t in range(width - 1 - k):
                         var is_v = init_row[(t + k) * is_ls].cast[accum_t]()
-                        local_dweight[k] = dpre_head[t].fma(
-                            is_v, local_dweight[k]
-                        )
+
+                        comptime if has_seq_idx:
+                            if t < seqlen:
+                                if si_row[t * si_ls] == si_row[0]:
+                                    local_dweight[k] = dpre_head[t].fma(
+                                        is_v, local_dweight[k]
+                                    )
+                        else:
+                            local_dweight[k] = dpre_head[t].fma(
+                                is_v, local_dweight[k]
+                            )
 
             # ---- main loop over t ----
             var fast = x_ls == 1 and dout_ls == 1 and dx_ls == 1

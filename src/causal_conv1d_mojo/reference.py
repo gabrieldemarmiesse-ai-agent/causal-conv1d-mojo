@@ -26,13 +26,20 @@ def causal_conv1d_ref(
     return_final_states: bool = False,
     final_states_out: torch.Tensor | None = None,
     activation: str | None = None,
+    seq_idx: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     x: (batch, dim, seqlen)
     weight: (dim, width)
     bias: (dim,)
+    seq_idx: (batch, seqlen)
     initial_states: (batch, dim, width - 1)
     final_states_out: (batch, dim, width - 1)
+
+    With seq_idx and initial_states together, the virtual initial-state
+    positions carry seq_idx[:, 0], so only the first packed sequence in
+    each batch row can read them. Negative seq_idx positions are padding
+    and produce zero output.
 
     out: (batch, dim, seqlen)
     """
@@ -42,7 +49,27 @@ def causal_conv1d_ref(
     x = x.to(weight.dtype)
     seqlen = x.shape[-1]
     dim, width = weight.shape
-    if initial_states is None:
+    if seq_idx is not None:
+        assert seq_idx.shape == (x.shape[0], seqlen)
+        assert not return_final_states, "seq_idx does not support return_final_states"
+        if initial_states is None:
+            x = F.pad(x, (width - 1, 0))
+            initial_state_seq_idx = seq_idx.new_full((x.shape[0], width - 1), -1)
+        else:
+            x = torch.cat([initial_states, x], dim=-1)
+            initial_state_seq_idx = seq_idx[:, :1].expand(-1, width - 1)
+        seq_idx_with_state = torch.cat([initial_state_seq_idx, seq_idx], dim=-1)
+        x_windows = x.unfold(dimension=-1, size=width, step=1)
+        seq_idx_windows = seq_idx_with_state.unfold(dimension=-1, size=width, step=1)
+        same_sequence = seq_idx_windows == seq_idx.unsqueeze(-1)
+        out = torch.sum(
+            x_windows * same_sequence.unsqueeze(1) * weight.view(1, dim, 1, width),
+            dim=-1,
+        )
+        if bias is not None:
+            out = out + bias.view(1, dim, 1)
+        out = out.masked_fill((seq_idx < 0).unsqueeze(1), 0.0)
+    elif initial_states is None:
         out = F.conv1d(x, weight.unsqueeze(1), bias, padding=width - 1, groups=dim)
     else:
         x = torch.cat([initial_states, x], dim=-1)

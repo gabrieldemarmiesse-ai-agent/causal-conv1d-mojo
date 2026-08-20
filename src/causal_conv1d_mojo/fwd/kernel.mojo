@@ -15,6 +15,9 @@ Design (matches upstream's tri-dao kernel):
   slot `kNThreads-1` carries the previous chunk's tail across chunks.
   Three-barrier dance keeps thread 0 and thread kNThreads-1 from
   trampling each other's reads/writes (mirrors upstream).
+- With packed sequences plus initial states, virtual positions before
+  t=0 carry `seq_idx[b, 0]`; the ordinary id gate therefore exposes the
+  initial state only to the first packed sequence in each batch row.
 
 This replaces the old design that had grid = (chunks, dim, batch): each
 chunk-block re-loaded weights/bias and re-read its left-halo from
@@ -73,8 +76,9 @@ def fwd_kernel[
     `has_initial_states`: `initial_states_ptr` is a `(B, D, W-1)` tensor
     that supplies the historical context before `t = 0`. For
     `src_t in [-(W-1), 0)`, we read `initial_states[b, c, src_t + W - 1]`
-    instead of treating the out-of-range position as zero. Mutually
-    exclusive with `has_seq_idx`.
+    instead of treating the out-of-range position as zero. When
+    `has_seq_idx` is also set, those virtual positions carry
+    `seq_idx[b, 0]`, so later packed sequences cannot read the state.
 
     `contig_inner`: the innermost stride of x/output is 1. Encoded by
     the dispatcher in the Layout types (`Idx[1]` in the inner-stride
@@ -262,7 +266,10 @@ def fwd_kernel[
 
         # ---- [P4] seq_idx window (only when has_seq_idx) ----
         # Needed at positions [seq_start - (W-1) .. seq_start + kNElts - 1].
-        # Out-of-range positions get -1 so the gate naturally fails.
+        # Out-of-range positions get -1 so the gate naturally fails,
+        # except that the dual seq_idx + initial_states variant assigns
+        # pre-t=0 positions the first packed sequence's id (upstream
+        # v1.7.0 semantics).
         comptime kSeqWindow: Int = (kWidth - 1) + kNElts
         var seq_window = InlineArray[Int32, kSeqWindow](uninitialized=True)
 
@@ -273,7 +280,14 @@ def fwd_kernel[
                 if 0 <= t_j and t_j < seqlen:
                     seq_window[j] = seq_idx[batch_id, t_j]
                 else:
-                    seq_window[j] = -1
+
+                    comptime if has_initial_states:
+                        if t_j < 0:
+                            seq_window[j] = seq_idx[batch_id, 0]
+                        else:
+                            seq_window[j] = -1
+                    else:
+                        seq_window[j] = -1
 
         # ---- [P5] Compute out[i] = bias + sum_w weight_vals[w] * x_vals[kNElts + i - (W-1-w)] ----
         var out_vals = SIMD[accum_t, kNElts](0)
