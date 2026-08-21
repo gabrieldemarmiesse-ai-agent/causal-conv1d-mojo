@@ -15,6 +15,8 @@ import torch
 
 import causal_conv1d_mojo
 
+from _helpers import _DX_TOL, _assert_dw_close, _max_diff, _ref_grads
+
 
 def _ref_fwd(x, w, b):
     return causal_conv1d_mojo.causal_conv1d_ref(x, w, b, activation="silu")
@@ -93,3 +95,52 @@ def test_bwd_noncontig_inner_stride(device, dtype):
     assert x_BLD.grad is not None and torch.isfinite(x_BLD.grad).all()
     assert weight.grad is not None and torch.isfinite(weight.grad).all()
     assert bias.grad is not None and torch.isfinite(bias.grad).all()
+
+
+@pytest.mark.parametrize(
+    "fallback",
+    ["dim_not_vectorized", "x_unaligned", "dout_unaligned", "bias_unaligned"],
+)
+def test_bwd_channel_last_vector_fallbacks(device, fallback):
+    """Unsafe channel-last vectors route to the generic strided kernel.
+
+    The dedicated kernel promises 16-byte accesses. A non-vector-sized
+    channel count or an offset x/dout/bias base must therefore fall back,
+    while still producing the same gradients as the PyTorch reference.
+    """
+    B, L, W = 2, 67, 4
+    D = 18 if fallback == "dim_not_vectorized" else 32
+    dtype = torch.float16
+
+    if fallback == "x_unaligned":
+        x_storage = torch.randn(B, L, D + 8, dtype=dtype, device=device)
+        x = x_storage[:, :, 1 : 1 + D].transpose(1, 2).requires_grad_()
+        assert x.data_ptr() % 16 != 0 and x.stride(2) % 8 == 0
+    else:
+        x = (
+            torch.randn(B, L, D, dtype=dtype, device=device)
+            .transpose(1, 2)
+            .requires_grad_()
+        )
+
+    weight = torch.randn(D, W, dtype=dtype, device=device, requires_grad=True)
+    if fallback == "bias_unaligned":
+        bias_storage = torch.randn(D + 8, dtype=dtype, device=device)
+        bias = bias_storage[1 : 1 + D].requires_grad_()
+        assert bias.data_ptr() % 16 != 0
+    else:
+        bias = torch.randn(D, dtype=dtype, device=device, requires_grad=True)
+
+    if fallback == "dout_unaligned":
+        dout_storage = torch.randn(B, L, D + 8, dtype=dtype, device=device)
+        dout = dout_storage[:, :, 1 : 1 + D].transpose(1, 2)
+        assert dout.data_ptr() % 16 != 0 and dout.stride(2) % 8 == 0
+    else:
+        dout = torch.randn_like(x)
+
+    out = causal_conv1d_mojo.causal_conv1d_fn(x, weight, bias, activation="silu")
+    out.backward(dout)
+    dx_ref, dw_ref, db_ref = _ref_grads(x, weight, bias, dout, "silu")
+    assert _max_diff(x.grad, dx_ref) < _DX_TOL[dtype]
+    _assert_dw_close(weight.grad, dw_ref, dtype, name=f"dw[{fallback}]")
+    _assert_dw_close(bias.grad, db_ref, dtype, name=f"db[{fallback}]")

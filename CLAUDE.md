@@ -215,8 +215,8 @@ exist**:
   Shapes suffixed `+cl` in `SHAPES` run with **channel-last** x/out
   (`--channel-last`): the quick tier gates the canonical shape in both
   layouts, and the FULL tier adds three channel-last shapes, so the
-  dedicated `fwd_channellast_kernel` is gated against upstream's own
-  channellast CUDA kernel (fwd only; bwd has no channel-last kernel).
+  dedicated forward and backward channel-last kernels are gated against
+  upstream's own channel-last CUDA kernels.
 - **(d) deep profiler** — cuda: `ncu` (ephemeral via `pixi exec`); metal:
   the per-encoder GPU time + clock split + duty cycle already parsed from
   the step-(c) trace; cpu: `perf stat` on Linux, `/usr/bin/sample` on
@@ -669,10 +669,19 @@ on H100 fp16 to ~1.0-1.3× on the same shapes):
    agent-scope on AMD). Default Mojo atomics lower to
    `ATOMG.E.ADD.F32.STRONG.SYS` (system-scope, sequentially consistent
    — drains L2, sync with CPU), which added ~750ns/block on bwd; GPU-
-   scope relaxed atomics are what CUDA's `atomicAdd` does. The
-   `DETERMINISTIC=true` leaf has no across-batch atomics: block `(b,d)`
-   plain-stores its reduced fp32 values into `(B,D,W)` / `(B,D)`
-   workspaces for Python's fixed-order `.sum(0)`.
+   scope relaxed atomics are what CUDA's `atomicAdd` does. In the
+   current Mojo toolchain fp32 `fetch_add` itself expands to a CAS retry
+   loop; that is negligible for generic bwd's one flush per `(B,D)`, but
+   disastrous for channel-last bwd's flush per `(B,L-chunk,D)`, so the
+   channel-last NVIDIA leaf uses inline PTX
+   `atom.relaxed.gpu.global.add.f32` instead (HIP/Metal keep the
+   portable relaxed atomic). The `DETERMINISTIC=true` leaf has no
+   across-batch atomics: block `(b,d)` plain-stores its reduced fp32
+   values into `(B,D,W)` / `(B,D)` workspaces for Python's fixed-order
+   `.sum(0)`. Because that workspace scheme is generic-kernel-only,
+   `_config_from_args` clears `channel_last` whenever `deterministic` is
+   set, so a packed channel-last backward in deterministic mode falls
+   back to the generic kernel.
 7. **Channel-last fwd kernel (`fwd_channellast_kernel`), all backends.**
    When x/out have dim contiguous (`x.stride(1)==1`, the layout a
    `(B, L, D)`-contiguous activation gets after `.transpose(1, 2)` —
@@ -742,8 +751,8 @@ on H100 fp16 to ~1.0-1.3× on the same shapes):
    applies the same gate to silu' recomputation, initial-state dweight
    terms, and `dinitial_states`. Padding ids (`seq_idx < 0`) still force
    output and `dpre` to zero. `seq_idx + return_final_states` remains
-   unsupported. seq_idx continues to route channel-last inputs through
-   the generic strided GPU kernel.
+   unsupported. Channel-last seq_idx inputs are handled directly by the
+   dedicated forward kernel (item 7) and backward kernel (item 10).
 9. **State buffers and update vectors.** Generic fwd/bwd access
    `initial_states` / `dinitial_states` one scalar at a time, so they do
    not participate in the 16-byte dispatch proof. Update's x, conv_state,
@@ -756,7 +765,39 @@ on H100 fp16 to ~1.0-1.3× on the same shapes):
    views take scalar history loads.
    unsupported. Eligible channel-last forward inputs use the dedicated
    kernel above; contiguous, wide-filter, dim-tail, or unaligned cases
-   retain the generic strided GPU fallback. Backward remains generic.
+   retain the generic strided GPU fallback. Backward has its own
+   channel-last kernel (item 10).
+10. **Channel-last bwd kernel (`bwd_channellast_kernel`), all backends.**
+   This follows upstream's shared-memory transpose rather than forward's
+   register-only row walk. A 128-thread block loads x/dout as 16-byte
+   vectors along contiguous C into padded `(L,C)` shared-memory tiles,
+   remaps threads so each owns one channel over a 32/64-row run, keeps
+   only that channel's W weights and dweight partials in registers, then
+   transposes dx through shared memory for coalesced vector stores. The
+   tile includes W-1 x rows on both sides and W-1 dout rows on the right,
+   so silu' recomputation, anti-causal dx, seq_idx gating, initial states,
+   and dinitial_states all match upstream v1.7.0 (including the virtual
+   `seq_idx[b,0]` id before t=0).
+
+   The launcher selects 128 rows when the grid is saturated and a 64-row
+   specialization for `L<=128` or an underfilled grid (target 1024 blocks
+   on CUDA/HIP, 512 on Metal); both live in one cached semantic variant.
+   `_jit.py` gates on width<=5, `dim % kNElts == 0`, channel stride one,
+   width-contiguous weights, 16-byte-aligned x/dout/dx/bias bases, and
+   vector-preserving batch/L strides. Anything unsafe (including wider
+   fp16/bf16 filters, odd channel counts, or sliced base pointers) stays
+   on the generic kernel. `_fn.py` first normalizes dout into x's layout
+   family, matching upstream.
+
+   On H100 PCIe, fp16 w4+silu+bias reaches 35.5 µs vs upstream 37.2 µs
+   at `(1,4096,2048,4)` (the scalar fallback was 216.4 µs); seq_idx is
+   50.5 vs 69.3 µs. bf16 is 36.3 vs 38.1 µs and 50.5 vs 69.2 µs with
+   seq_idx. The small `(1,1024,2048,4)` tile is at parity (9.51 vs
+   9.27 µs), while `(8,2048,4096,4)` is 273.2 vs 300.5 µs. ncu on the
+   canonical fp16 kernel reports 128 registers/thread, 38.16 KiB shared
+   memory/block, 1,152,768 global-load sectors (the same as upstream),
+   and 9.2% long-scoreboard / 2.6% barrier stalls. The generic kernel's
+   before/after PTX is byte-identical.
 
 ## CPU kernel design (`fwd_cpu/`, `bwd_full_cpu/`, `update_cpu/`)
 
