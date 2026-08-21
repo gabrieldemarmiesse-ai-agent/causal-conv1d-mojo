@@ -1,6 +1,6 @@
 """JIT-on-first-use dispatcher for causal_conv1d fwd.
 
-Each unique runtime config (dtype × width × has_bias × has_seq_idx ×
+Each unique runtime config (dtype × wdtype × width × has_bias × has_seq_idx ×
 has_initial_states × apply_silu × contig_inner × aligned_seq ×
 vec_aligned × use_external_stream) compiles the static
 ``fwd/variant.mojo`` once via ``mojo build -D KEY=VALUE …``, caches
@@ -34,6 +34,7 @@ _DTYPE_DEFINE = {0: "float16", 1: "bfloat16", 2: "float32"}
 # Per-thread element count: 8 for fp16/bf16, 4 for fp32. Mirrors
 # `kNEltsFwd` in fwd/common.mojo.
 _KN_ELTS = {0: 8, 1: 8, 2: 4}
+_DTYPE_SIZE = {0: 2, 1: 2, 2: 4}
 # Block size (`kNThreads` in fwd/common.mojo).
 _KNTHREADS = 128
 _ELEMENT_SIZE = {0: 2, 1: 2, 2: 4}
@@ -53,7 +54,7 @@ def _rows_are_16b_aligned(
 def call_fwd(args: tuple, pre_dispatch: Callable[[], None] | None = None) -> None:
     """JIT-compile (if needed) and dispatch a single fwd call.
 
-    ``args`` is the 29-tuple of runtime values built by
+    ``args`` is the 31-tuple of runtime values built by
     ``fwd/__init__.py::native_fwd``. ``pre_dispatch`` runs after the
     (possibly seconds-long) JIT compile and immediately before the
     kernel launch — the MPS path uses it to revive the argument
@@ -64,19 +65,20 @@ def call_fwd(args: tuple, pre_dispatch: Callable[[], None] | None = None) -> Non
     variant_fn, ctx_handle = _get_variant_fn(_config_from_args(args))
     if pre_dispatch is not None:
         pre_dispatch()
-    # Tack ctx_handle on as the 30th positional arg — the variant
-    # entry point destructures `args[29]` for it. Avoids the per-call
+    # Tack ctx_handle on as the 32nd positional arg — the variant
+    # entry point destructures `args[31]` for it. Avoids the per-call
     # hipStreamCreate/Destroy churn from `var ctx = DeviceContext()`.
     variant_fn(*args, ctx_handle)
 
 
 def _config_from_args(args: tuple) -> tuple:
     dtype_code = args[17]
-    width = args[23]
+    wdtype_code = args[18]
+    width = args[24]
     has_bias = bool(args[15])
     apply_silu = bool(args[16])
-    has_seq_idx = bool(args[19])
-    has_initial_states = bool(args[24])
+    has_seq_idx = bool(args[20])
+    has_initial_states = bool(args[25])
     seqlen = args[6]
     contig_inner = args[9] == 1 and args[11] == 1 and args[14] == 1
     element_size = _ELEMENT_SIZE[dtype_code]
@@ -99,11 +101,11 @@ def _config_from_args(args: tuple) -> tuple:
     # (no CUDA-style streams; enqueue on the DeviceContext directly +
     # sync after). Passed as comptime so the variant only codegens one
     # branch — a runtime `if` here costs ~30 μs/call on NVIDIA, even
-    # when the branch is perfectly predictable. `args[29]` is set by
+    # when the branch is perfectly predictable. `args[30]` is set by
     # the Python wrappers (`native_fwd` passes 1, `native_fwd_mps`
     # passes 0). Can't be derived from `stream_handle_addr` itself
     # because torch's default CUDA stream has cuda_stream == 0.
-    use_external_stream = bool(args[29])
+    use_external_stream = bool(args[30])
     # Channel-last fast path: x/out have dim contiguous (stride(1)==1)
     # and seqlen strided — the layout a (B, L, D)-contiguous activation
     # gets after .transpose(1, 2), i.e. upstream's `is_channel_last`
@@ -113,6 +115,7 @@ def _config_from_args(args: tuple) -> tuple:
     # the same fast path: the kernel carries row ids beside its x halo,
     # matching upstream's requirement that seq_idx inputs be channel-last.
     kn = _KN_ELTS[dtype_code]
+    weight_vec_bytes = kn * _DTYPE_SIZE[wdtype_code]
     channel_last = (
         # The unrolled row walk carries the halo in xv registers, which
         # requires width - 1 <= kUnroll (= 4 in kernel.mojo). Wider
@@ -134,7 +137,9 @@ def _config_from_args(args: tuple) -> tuple:
         # and the kernel's loads/stores are alignment=16 vectors.
         and args[0] % 16 == 0  # x
         and args[3] % 16 == 0  # out
-        and (not has_bias or args[2] % 16 == 0)  # bias
+        # The bias vector owns `kn` channels too, but its byte width is
+        # keyed on wdtype: e.g. fp16 x + fp32 bias is 8 * 4 = 32 B.
+        and (not has_bias or args[2] % weight_vec_bytes == 0)  # bias
     )
     if channel_last:
         # These three only parameterize the generic kernel; pin them so
@@ -144,6 +149,7 @@ def _config_from_args(args: tuple) -> tuple:
         vec_aligned = False
     return (
         dtype_code,
+        wdtype_code,
         width,
         has_bias,
         has_seq_idx,
@@ -163,9 +169,9 @@ def _mod_name(config: tuple) -> str:
     Used as the cache key. Reading it should be enough to reproduce
     the config by hand.
     """
-    (dt, w, hb, hs, hi, silu, c, a, va, cl, ues) = config
+    (dt, wdt, w, hb, hs, hi, silu, c, a, va, cl, ues) = config
     return (
-        f"{_DTYPE_NAME[dt]}_w{w}"
+        f"{_DTYPE_NAME[dt]}_w{_DTYPE_NAME[wdt]}_w{w}"
         f"_hb{int(hb)}_hs{int(hs)}_hi{int(hi)}_silu{int(silu)}"
         f"_contig{int(c)}_chunk16{int(a)}_vec16{int(va)}_cl{int(cl)}"
         f"_extstr{int(ues)}"
@@ -177,13 +183,14 @@ def _defines(config: tuple) -> dict[str, str]:
 
     The corresponding `comptime` reads live in `fwd/variant.mojo`.
     """
-    (dt, w, hb, hs, hi, silu, c, a, va, cl, ues) = config
+    (dt, wdt, w, hb, hs, hi, silu, c, a, va, cl, ues) = config
 
     def b(x: bool) -> str:
         return "true" if x else "false"
 
     return {
         "DTYPE": _DTYPE_DEFINE[dt],
+        "WDTYPE": _DTYPE_DEFINE[wdt],
         "WIDTH": str(w),
         "HAS_BIAS": b(hb),
         "HAS_SEQ_IDX": b(hs),

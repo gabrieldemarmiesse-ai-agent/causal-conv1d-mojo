@@ -24,6 +24,7 @@ def native_bwd_full_cpu(
 ) -> None:
     config = (
         _DTYPE_CODE[x.dtype],
+        _DTYPE_CODE[weight.dtype],
         weight.shape[1],  # width
         bias is not None,  # has_bias
         seq_idx is not None,  # has_seq_idx

@@ -11,7 +11,7 @@ upstream Tri Dao CUDA", with upstream as the moving target.
     Pure JIT-on-first-use — there is no `dispatch.mojo` and no AOT
     comptime sweep. Every subpackage has:
     - `kernel.mojo` (the device function — comptime-parameterized
-      over dtype, width, has_bias, ...).
+      over input dtype, weight dtype, width, has_bias, ...).
     - `common.mojo` (shared constants/helpers).
     - `launch.mojo` (`launch_<sub>[...]`: configures the
       `DeviceContext`, builds the `TileTensor` layouts, calls
@@ -38,7 +38,8 @@ upstream Tri Dao CUDA", with upstream as the moving target.
     bakes host SIMD into the `.so`'s host-side glue, so different CPUs
     must not share cache entries), and `<mod_name>` is a readable
     config string like
-    `fp16_w4_hb0_hs0_hi0_silu0_contig1_chunk161_vec161_cl0_extstr1`.
+    `fp16_wfp32_w4_hb0_hs0_hi0_silu0_contig1_chunk161_vec161_cl0_extstr1`
+    (input fp16, weight/bias fp32).
     See "Cache-key contents" below for what `<h>` covers.
   - `fwd_cpu/`, `bwd_full_cpu/`, `update_cpu/`: CPU kernels. Same
     JIT-on-first-use plumbing as the GPU subpackages — each (subpkg,
@@ -649,7 +650,7 @@ on H100 fp16 to ~1.0-1.3× on the same shapes):
    `chunk16{0,1}` and `vec16{0,1}`. Backward's 8-element fp16/bf16
    `n_elts` choice is likewise allowed only after x/dout/dx pass the
    16-byte row proof; otherwise it uses the 4-element generic variant.
-5. **One cubin per (dtype × width × has_bias × has_seq_idx ×
+5. **One cubin per (dtype × wdtype × width × has_bias × has_seq_idx ×
    has_initial_states × apply_silu × contig_inner × aligned_seq ×
    vec_aligned) leaf,
    compiled JIT on first use.** Each leaf compiles to its own
@@ -698,8 +699,11 @@ on H100 fp16 to ~1.0-1.3× on the same shapes):
      ~8× upstream's *total* L1 load-sector count on their own
      (`l1tex__t_sectors_..._op_ld.sum` is the tell). The block now
      cooperatively copies its `(kChunkC × W)` tile through smem
-     (tap-major so read-back is a conflict-free 16-byte smem vector
-     per tap), and bias is one 16-byte vector load.
+     (tap-major so read-back is a conflict-free vector per tap), and
+     bias is one vector load. Each thread still owns
+     `kNElts(dtype)` channels, so the weight/bias vector spans
+     `kNElts(dtype) * sizeof(wdtype)` bytes: 8, 16, or 32 across the
+     supported pairs.
    - **Row-walk unrolled ×4** (`kUnroll`): 4 independent x-row loads
      in flight per warp before any is consumed. The kernel is
      register-capped at ~20 warps/SM (84 regs/thread), so one
@@ -714,7 +718,9 @@ on H100 fp16 to ~1.0-1.3× on the same shapes):
    within ~8% of the seqlen-contiguous kernel there. seq_idx still
    takes the generic path (upstream is the opposite: their seq_idx
    *requires* channel-last). The dispatch gate requires 16B-aligned
-   x/out/bias base pointers and x/out batch + seqlen strides divisible
+   x/out base pointers, a bias pointer aligned to its
+   `kNElts * sizeof(wdtype)` vector width (8/16/32 bytes depending on the
+   dtype pair), and x/out batch + seqlen strides divisible
    by `kNElts` elements. Because `kNElts = 16 / sizeof(dtype)`, that
    element-stride condition is exactly a 16-byte stride for fp16, bf16,
    and fp32; together with `c0` advancing by `kNElts`, it covers every
@@ -759,7 +765,7 @@ on H100 fp16 to ~1.0-1.3× on the same shapes):
    and out token-loop accesses are also scalar and honor their element
    strides, which makes offset columns such as `big[:, :, 5]` safe. Its
    weight vector is enabled only when width stride is 1 and the base plus
-   channel stride preserve `sizeof(dtype) * width` alignment; otherwise
+   channel stride preserve `sizeof(wdtype) * width` alignment; otherwise
    the taps are scalar-loaded with `w_w_stride`. The short linear-state
    vector load is used only for `state_l_stride == 1`; strided conv-state
    views take scalar history loads.
@@ -798,12 +804,31 @@ on H100 fp16 to ~1.0-1.3× on the same shapes):
    memory/block, 1,152,768 global-load sectors (the same as upstream),
    and 9.2% long-scoreboard / 2.6% barrier stalls. The generic kernel's
    before/after PTX is byte-identical.
+11. **Independent input and parameter dtypes (`dtype`, `wdtype`).** All
+   six kernels template the activation/state/output type separately
+   from the weight/bias type. `weight` and `bias` share `wdtype`; every
+   loaded parameter value is converted to the existing fp32 accumulator
+   before the FMA chain. `x`, out/state tensors, dx, and
+   dinitial_states stay `dtype`; dweight/dbias accumulate in fp32 and
+   Python casts them back to their parameter dtype. Width limits and
+   `kNElts` remain keyed on `dtype`. The dedicated channel-last forward
+   and backward kernels take the same `wdtype` for their weight/bias
+   pointers; both read those scalar from global (forward stages its tile
+   through smem), so no parameter vector width depends on the pair.
+   When `wdtype == dtype`, pointer
+   types and vector alignments resolve to the previous specialization,
+   so the same-dtype instruction path and fwd↔update bit-exactness
+   contract are unchanged.
 
 ## CPU kernel design (`fwd_cpu/`, `bwd_full_cpu/`, `update_cpu/`)
 
 The CPU kernels were rewritten from scalar TileTensor loops to
 raw-pointer kernels with an explicitly vectorized main body (3.4–6.5×
 on fwd/bwd, up to ~140× on update at M4 decode shapes). The patterns:
+
+As on GPU, `dtype` types activations/state/output while `wdtype` types
+only weight/bias; both are cast to fp32 at load time for the existing
+accumulation chain.
 
 1. **Raw pointers + element strides, no TileTensor.** `variant.mojo`
    decodes the args tuple into `UnsafePointer` + `Int` strides; each

@@ -35,6 +35,7 @@ from kernel import kNThreadsUpdate, update_kernel
 
 def launch_update[
     dtype: DType,
+    wdtype: DType,
     width: Int,
     has_bias: Bool,
     apply_silu: Bool,
@@ -88,10 +89,10 @@ def launch_update[
     var x_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
         unsafe_from_address=x_addr
     )
-    var w_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
+    var w_ptr = UnsafePointer[Scalar[wdtype], MutAnyOrigin](
         unsafe_from_address=w_addr
     )
-    var b_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
+    var b_ptr = UnsafePointer[Scalar[wdtype], MutAnyOrigin](
         unsafe_from_address=b_addr
     )
     var state_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
@@ -110,6 +111,7 @@ def launch_update[
     var compiled = ctx.compile_function[
         update_kernel[
             dtype,
+            wdtype,
             width,
             has_bias,
             apply_silu,

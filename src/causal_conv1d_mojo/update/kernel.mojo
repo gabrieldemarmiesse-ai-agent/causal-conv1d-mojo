@@ -6,6 +6,9 @@ decode op: for each batch element, take a tiny slice of new tokens
 decoding), update the rolling `conv_state[b, :, 0..state_len)` buffer,
 and emit the conv output.
 
+Input/state/output use `dtype`; weight/bias independently use `wdtype`
+and are converted to fp32 immediately after loading.
+
 State semantics (linear / non-circular):
 - `conv_state[b, c, :]` holds the most recent `state_len` x values for
   channel `c` of batch `b`, with the oldest at index 0 and the most
@@ -105,6 +108,7 @@ comptime kNThreadsUpdate: Int = 64
 )
 def update_kernel[
     dtype: DType,
+    wdtype: DType,
     width: Int,
     has_bias: Bool,
     apply_silu: Bool,
@@ -117,8 +121,8 @@ def update_kernel[
     seqlen: Int32,
     state_len: Int32,
     x_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    w_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    bias_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    w_ptr: UnsafePointer[Scalar[wdtype], MutAnyOrigin],
+    bias_ptr: UnsafePointer[Scalar[wdtype], MutAnyOrigin],
     state_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     state_indices_ptr: UnsafePointer[Int32, MutAnyOrigin],
     cache_seqlens_ptr: UnsafePointer[Int32, MutAnyOrigin],
@@ -189,7 +193,9 @@ def update_kernel[
     # single `global_load_dwordx2` without a hand-typed vec load.
     var weights = SIMD[accum_t, width](0)
     comptime if weight_vec_aligned:
-        var w_vec = w_lane.load[width=width, alignment = size_of[dtype]() * width](0)
+        var w_vec = w_lane.load[
+            width=width, alignment = size_of[wdtype]() * width
+        ](0)
         comptime for k in range(width):
             weights[k] = w_vec[k].cast[accum_t]()
     else:

@@ -13,6 +13,7 @@ from std.sys import get_defined_bool, get_defined_dtype, get_defined_int
 from kernel import update_kernel_cpu
 
 comptime DTYPE = get_defined_dtype["DTYPE", DType.float32]()
+comptime WDTYPE = get_defined_dtype["WDTYPE", DType.float32]()
 comptime WIDTH = get_defined_int["WIDTH"]()
 comptime HAS_BIAS = get_defined_bool["HAS_BIAS"]()
 comptime APPLY_SILU = get_defined_bool["APPLY_SILU"]()
@@ -53,10 +54,10 @@ def causal_conv1d_update_cpu_variant(
     var x_ptr = UnsafePointer[Scalar[DTYPE], MutAnyOrigin](
         unsafe_from_address=x_addr
     )
-    var w_ptr = UnsafePointer[Scalar[DTYPE], MutAnyOrigin](
+    var w_ptr = UnsafePointer[Scalar[WDTYPE], MutAnyOrigin](
         unsafe_from_address=w_addr
     )
-    var b_ptr = UnsafePointer[Scalar[DTYPE], MutAnyOrigin](
+    var b_ptr = UnsafePointer[Scalar[WDTYPE], MutAnyOrigin](
         unsafe_from_address=b_addr
     )
     var state_ptr = UnsafePointer[Scalar[DTYPE], MutAnyOrigin](
@@ -74,6 +75,7 @@ def causal_conv1d_update_cpu_variant(
 
     update_kernel_cpu[
         DTYPE,
+        WDTYPE,
         WIDTH,
         HAS_BIAS,
         APPLY_SILU,

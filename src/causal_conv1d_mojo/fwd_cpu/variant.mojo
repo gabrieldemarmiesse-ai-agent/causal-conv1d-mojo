@@ -1,7 +1,7 @@
 """Static per-config variant entry point for causal_conv1d_fwd_cpu.
 
 Replaces the old AOT comptime-sweep `dispatch.mojo`. All comptime
-params (dtype, width, has_bias, …) come from `-D` defines set by
+params (dtype, wdtype, width, has_bias, …) come from `-D` defines set by
 `_jit.py`, so we compile only the variant the caller actually needs.
 
 Runtime args tuple (22 positionals) is built in
@@ -20,6 +20,7 @@ from std.sys import get_defined_bool, get_defined_dtype, get_defined_int
 from kernel import fwd_kernel_cpu
 
 comptime DTYPE = get_defined_dtype["DTYPE", DType.float32]()
+comptime WDTYPE = get_defined_dtype["WDTYPE", DType.float32]()
 comptime WIDTH = get_defined_int["WIDTH"]()
 comptime HAS_BIAS = get_defined_bool["HAS_BIAS"]()
 comptime HAS_SEQ_IDX = get_defined_bool["HAS_SEQ_IDX"]()
@@ -60,10 +61,10 @@ def causal_conv1d_fwd_cpu_variant(
     var x_ptr = UnsafePointer[Scalar[DTYPE], MutAnyOrigin](
         unsafe_from_address=x_addr
     )
-    var w_ptr = UnsafePointer[Scalar[DTYPE], MutAnyOrigin](
+    var w_ptr = UnsafePointer[Scalar[WDTYPE], MutAnyOrigin](
         unsafe_from_address=w_addr
     )
-    var b_ptr = UnsafePointer[Scalar[DTYPE], MutAnyOrigin](
+    var b_ptr = UnsafePointer[Scalar[WDTYPE], MutAnyOrigin](
         unsafe_from_address=b_addr
     )
     var seq_idx_ptr = UnsafePointer[Int32, MutAnyOrigin](
@@ -78,6 +79,7 @@ def causal_conv1d_fwd_cpu_variant(
 
     fwd_kernel_cpu[
         DTYPE,
+        WDTYPE,
         WIDTH,
         HAS_BIAS,
         HAS_SEQ_IDX,
