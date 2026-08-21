@@ -607,7 +607,7 @@ def test_zero_sized_forward(device, dtype, shape, activation, bias_present):
 # ===---------- widths 5..9 (newly supported beyond upstream's 2..4) ----------=== #
 #
 # Upstream causal-conv1d only ships widths 2..4. Since we JIT-compile
-# per (dtype × width × ...) leaf on first use, supporting wider kernels
+# per (dtype × wdtype × width × ...) leaf on first use, supporting wider kernels
 # is "free" up to the smem-halo limit kWidth - 1 ≤ kNElts:
 #   * kNElts = 8 for fp16/bf16 → widths up to 9
 #   * kNElts = 4 for fp32 → widths up to 5
