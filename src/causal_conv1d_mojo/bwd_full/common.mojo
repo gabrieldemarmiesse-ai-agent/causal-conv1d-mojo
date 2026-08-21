@@ -24,3 +24,14 @@ comptime kNElts: Int = 4
 # chunk element count for fp16/bf16 vs the old uniform-4 setting.
 def kNEltsBwd_for[dtype: DType]() -> Int:
     return 16 // size_of[dtype]()
+
+
+# Channel-last backward transposes a row-major (L, C) tile through shared
+# memory. Each load thread owns one 16-byte channel vector; eight adjacent
+# threads therefore cover the same 128-byte channel span as upstream.
+comptime kChunkLBwdCLLong: Int = 128
+comptime kChunkLBwdCLShort: Int = 64
+
+
+def kChunkCBwdCL_for[dtype: DType]() -> Int:
+    return 128 // size_of[dtype]()

@@ -2,7 +2,7 @@
 
 Each unique runtime config (dtype × n_elts × width × has_bias ×
 has_seq_idx × has_initial_states × apply_silu × contig_inner ×
-aligned_seq × deterministic × use_external_stream) compiles the static
+aligned_seq × deterministic × channel_last × use_external_stream) compiles the static
 ``bwd_full/variant.mojo`` once via ``mojo build -D KEY=VALUE …`` and
 caches the resulting ``.so`` on disk.
 
@@ -93,32 +93,72 @@ def _config_from_args(args: tuple) -> tuple:
         and _rows_are_16b_aligned(args[4], args[18], args[19], element_size)
     )
 
-    # Match the original dispatcher's runtime n_elts pick: wide only if
-    # (a) wide differs from narrow (i.e. dtype is 16-bit), (b) seqlen is
-    # aligned to kNThreads * wide, and (c) every row of every tensor this
-    # variant vector-accesses (x, dout, dx) is 16-byte aligned. Otherwise
-    # use the narrow, alignment-agnostic variant.
-    #
-    # (c) applies only to the contiguous-inner path: that is the one that
-    # issues 16-byte accesses along a row. A strided x (channel-last, or
-    # any non-unit seqlen stride) is read scalar, so its row bases can't
-    # fault and the wide halo stays available — which is what widths 6..9
-    # need, and what this dispatcher did before the alignment proof was
-    # added.
-    vec_rows_ok = rows_16b_aligned or not contig_inner
     n_elts_wide = _KN_ELTS_WIDE[dtype_code]
-    use_wide = (
-        vec_rows_ok
-        and n_elts_wide != _KN_ELTS_NARROW
-        and (seqlen % (_KNTHREADS * n_elts_wide)) == 0
+    deterministic = bool(args[40])
+    # A `(B,L,D)`-contiguous allocation transposed to `(B,D,L)` has
+    # channel stride one and seqlen stride >1. The dedicated kernel
+    # vectorizes x/dout/dx along channels, so every base and row/batch
+    # stride participating in a 16-byte access must preserve alignment.
+    # Width >5 remains on the generic kernel (fp16/bf16 generic supports
+    # up to 9); the channel-last register arrays are sized for W<=5.
+    #
+    # Deterministic mode is the one hard exclusion: the channel-last
+    # kernel reduces dweight/dbias with device-scope float atomics, which
+    # is exactly the across-block nondeterminism `deterministic` exists to
+    # remove. Fall back to the (workspace-capable) generic kernel there
+    # until a `(B, n_L_chunks, D, W)` workspace variant is added here.
+    channel_last = (
+        not deterministic
+        and width <= 5
+        and args[11] == 1  # x_c_stride
+        and args[12] > 1  # x_l_stride
+        and args[14] == 1  # weight width-contiguous
+        and args[16] == 1  # dout_c_stride
+        and args[17] > 1  # dout_l_stride
+        and args[19] == 1  # dx_c_stride
+        and args[20] > 1  # dx_l_stride
+        and args[8] % n_elts_wide == 0  # dim
+        and args[10] % n_elts_wide == 0  # x batch stride
+        and args[12] % n_elts_wide == 0  # x seqlen stride
+        and args[15] % n_elts_wide == 0  # dout batch stride
+        and args[17] % n_elts_wide == 0  # dout seqlen stride
+        and args[18] % n_elts_wide == 0  # dx batch stride
+        and args[20] % n_elts_wide == 0  # dx seqlen stride
+        and args[0] % 16 == 0  # x base
+        and args[3] % 16 == 0  # dout base
+        and args[4] % 16 == 0  # dx base
+        and (not has_bias or args[2] % 16 == 0)  # bias base
     )
-    n_elts = n_elts_wide if use_wide else _KN_ELTS_NARROW
-    aligned_seq = vec_rows_ok and (seqlen % (_KNTHREADS * n_elts)) == 0
+    if channel_last:
+        # Generic-only choices are pinned so seqlen/layout details do not
+        # fragment the channel-last cache. The CL kernel derives its own
+        # 16-byte vector width from dtype and handles tail rows directly.
+        n_elts = n_elts_wide
+        contig_inner = False
+        aligned_seq = False
+    else:
+        # Match the original dispatcher's runtime n_elts pick: wide only if
+        # (a) wide differs from narrow (i.e. dtype is 16-bit), (b) seqlen is
+        # aligned to kNThreads * wide, and (c) every row of every tensor this
+        # variant vector-accesses (x, dout, dx) is 16-byte aligned. Otherwise
+        # use the narrow, alignment-agnostic variant.
+        #
+        # (c) applies only to the contiguous-inner path: that is the one that
+        # issues 16-byte accesses along a row. A strided x (any non-unit
+        # seqlen stride) is read scalar, so its row bases can't fault and the
+        # wide halo stays available — which is what widths 6..9 need.
+        vec_rows_ok = rows_16b_aligned or not contig_inner
+        use_wide = (
+            vec_rows_ok
+            and n_elts_wide != _KN_ELTS_NARROW
+            and (seqlen % (_KNTHREADS * n_elts_wide)) == 0
+        )
+        n_elts = n_elts_wide if use_wide else _KN_ELTS_NARROW
+        aligned_seq = vec_rows_ok and (seqlen % (_KNTHREADS * n_elts)) == 0
     # See fwd/_jit.py for why this is comptime instead of a runtime
     # branch on `stream_handle_addr`. Python wrapper sets 1 for CUDA,
     # 0 for Metal.
     use_external_stream = bool(args[39])
-    deterministic = bool(args[40])
 
     return (
         dtype_code,
@@ -131,21 +171,23 @@ def _config_from_args(args: tuple) -> tuple:
         contig_inner,
         aligned_seq,
         deterministic,
+        channel_last,
         use_external_stream,
     )
 
 
 def _mod_name(config: tuple) -> str:
-    (dt, ne, w, hb, hs, hi, silu, c, a, det, ues) = config
+    (dt, ne, w, hb, hs, hi, silu, c, a, det, cl, ues) = config
     return (
         f"{_DTYPE_NAME[dt]}_n{ne}_w{w}"
         f"_hb{int(hb)}_hs{int(hs)}_hi{int(hi)}_silu{int(silu)}"
-        f"_contig{int(c)}_chunk16{int(a)}_det{int(det)}_extstr{int(ues)}"
+        f"_contig{int(c)}_chunk16{int(a)}_det{int(det)}_cl{int(cl)}"
+        f"_extstr{int(ues)}"
     )
 
 
 def _defines(config: tuple) -> dict[str, str]:
-    (dt, ne, w, hb, hs, hi, silu, c, a, det, ues) = config
+    (dt, ne, w, hb, hs, hi, silu, c, a, det, cl, ues) = config
 
     def b(x: bool) -> str:
         return "true" if x else "false"
@@ -161,6 +203,7 @@ def _defines(config: tuple) -> dict[str, str]:
         "CONTIG_INNER": b(c),
         "ALIGNED_SEQ": b(a),
         "DETERMINISTIC": b(det),
+        "CHANNEL_LAST": b(cl),
         "USE_EXTERNAL_STREAM": b(ues),
     }
 

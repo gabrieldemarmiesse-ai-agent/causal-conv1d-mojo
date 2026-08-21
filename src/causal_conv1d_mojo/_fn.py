@@ -333,7 +333,15 @@ class _CausalConv1dFn(torch.autograd.Function):
         seqlen = x.shape[-1]
         deterministic = _use_deterministic_mode()
 
-        if dout.stride(-1) != 1:
+        # Preserve the same layout family as x. Upstream normalizes dout
+        # this way before dispatch: a channel-last x needs channel-last
+        # dout for the dedicated vectorized backward kernel, while the
+        # ordinary path needs seqlen contiguous. A gradient with neither
+        # axis contiguous is copied into the matching family.
+        is_channel_last = x.stride(1) == 1 and x.stride(2) > 1
+        if is_channel_last and dout.stride(1) != 1:
+            dout = dout.transpose(-1, -2).contiguous().transpose(-1, -2)
+        elif not is_channel_last and dout.stride(-1) != 1:
             dout = dout.contiguous()
 
         # Widths 6..9 need the bwd kernel's 8-element halo. Its wide
