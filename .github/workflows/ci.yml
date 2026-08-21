@@ -36,6 +36,7 @@ jobs:
       fail-fast: false
       matrix:
         test_file:
+          - tests/test_alignment.py
           - tests/test_bwd.py
           - tests/test_determinism.py
           - tests/test_fwd.py
