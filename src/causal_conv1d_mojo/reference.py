@@ -83,9 +83,18 @@ def causal_conv1d_ref(
     out = out[..., :seqlen]
     if return_final_states:
         # (batch, dim, width - 1)
-        # final_states is input_t upstream and copies the original input,
-        # not the weight_t cast used only for convolution arithmetic.
-        final_states = F.pad(x_input, (width - 1 - x_input.shape[-1], 0)).to(dtype_in)
+        # Same window as upstream (the last W-1 of `[initial_states, x]`,
+        # left zero-padded when that is shorter than W-1), but sliced
+        # from the *input-typed* tensors: final_states is input_t
+        # upstream, and rounding it through the weight_t cast used only
+        # for the conv arithmetic would lose precision when the dtypes
+        # differ.
+        src = (
+            x_input
+            if initial_states is None
+            else torch.cat([initial_states, x_input], dim=-1)
+        )
+        final_states = F.pad(src, (width - 1 - src.shape[-1], 0)).to(dtype_in)
         if final_states_out is not None:
             final_states_out.copy_(final_states)
         else:
