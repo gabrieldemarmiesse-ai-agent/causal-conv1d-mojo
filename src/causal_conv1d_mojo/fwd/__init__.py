@@ -17,11 +17,12 @@ def native_fwd(
     out: torch.Tensor,
     apply_silu: bool,
 ) -> None:
-    # The 29-tuple expected by the JIT-generated variant entry point.
+    # The 30-tuple expected by the JIT-generated variant entry point.
     # Each unique runtime config (dtype × width × has_bias × has_seq_idx ×
-    # has_initial_states × apply_silu × contig_inner × aligned_seq) lazily
-    # compiles its own single-variant `.so` on first use, then caches it
-    # under `$XDG_CACHE_HOME/causal_conv1d_mojo/fwd/` for future processes.
+    # has_initial_states × apply_silu × contig_inner × aligned_seq ×
+    # vec_aligned × channel_last) lazily compiles its own single-variant
+    # `.so` on first use, then caches it under
+    # `$XDG_CACHE_HOME/causal_conv1d_mojo/fwd/` for future processes.
     from causal_conv1d_mojo.fwd._jit import call_fwd
 
     call_fwd(

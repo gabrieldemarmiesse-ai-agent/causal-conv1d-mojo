@@ -77,6 +77,13 @@ So this kernel keeps raw pointers + Int32 strides, and indexes by
 hand. Matches upstream Tri Dao's `index_t = uint32_t` approach. If
 TileTensor ever grows a way to pass the layout as scalar kernargs
 (not a packed struct), revisit.
+
+The weight vector load is enabled only when the dispatcher proves the
+base and every channel row meet its `sizeof(dtype) * width` alignment
+and the width stride is one. Linear conv-state history uses a vector
+load only for `state_l_stride == 1`; arbitrary strided state views use
+scalar indexing. x/state/out accesses in the token loop are scalar and
+therefore safe for offset views such as `big[:, :, 5]`.
 """
 
 from std.gpu import block_idx, thread_idx
@@ -103,6 +110,8 @@ def update_kernel[
     apply_silu: Bool,
     has_state_indices: Bool,
     is_circular: Bool,
+    weight_vec_aligned: Bool,
+    state_contig: Bool,
 ](
     dim: Int32,
     seqlen: Int32,
@@ -118,6 +127,7 @@ def update_kernel[
     x_c_stride: Int32,
     x_l_stride: Int32,
     w_c_stride: Int32,
+    w_w_stride: Int32,
     state_b_stride: Int32,
     state_c_stride: Int32,
     state_l_stride: Int32,
@@ -133,6 +143,10 @@ def update_kernel[
             `state_indices[b] < 0` → output zeros for that batch element.
         is_circular: treat conv_state as a circular buffer; cache_seqlens
             holds the per-batch write head.
+        weight_vec_aligned: width-stride and row addresses permit the
+            `sizeof(dtype) * width` weight vector load.
+        state_contig: conv_state's inner stride is one, permitting the
+            short linear-history vector load.
     Pointers gated False by comptime are never dereferenced.
     """
     comptime accum_t = DType.float32
@@ -174,13 +188,13 @@ def update_kernel[
     # channel. amdgcn won't fold (width=4) `global_load_ushort`s into a
     # single `global_load_dwordx2` without a hand-typed vec load.
     var weights = SIMD[accum_t, width](0)
-    comptime if width == 2 or width == 4:
+    comptime if weight_vec_aligned:
         var w_vec = w_lane.load[width=width, alignment = size_of[dtype]() * width](0)
         comptime for k in range(width):
             weights[k] = w_vec[k].cast[accum_t]()
     else:
         comptime for k in range(width):
-            weights[k] = w_lane.load(k).cast[accum_t]()
+            weights[k] = w_lane.load(Int32(k) * w_w_stride).cast[accum_t]()
 
     var bias_v: Scalar[accum_t] = 0
     comptime if has_bias:
@@ -221,7 +235,7 @@ def update_kernel[
         # Phase 2 (linear): read trailing W-1 history into x_vals (with
         # writeback for the small-state_len edge case).
         var state_vals = SIMD[dtype, width - 1](0)
-        comptime if width == 3 or width == 4:
+        comptime if state_contig and (width == 3 or width == 4):
             var s_vec = state_lane.load[width = width - 1, alignment=2](
                 Int((sl - Int32(width - 1)) * state_l_stride)
             )
