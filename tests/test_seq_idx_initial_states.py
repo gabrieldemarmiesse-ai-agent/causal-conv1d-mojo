@@ -120,8 +120,10 @@ def test_causal_conv1d_ref_varlen_initial_states(device):
 # seqlens, contiguous/channel-last x, bias/no-bias, and silu/no activation.
 _VARLEN_CASES = [
     pytest.param(torch.float16, 2, 8, False, True, None, id="fp16-w2-contig"),
+    pytest.param(torch.float16, 2, 151, True, False, "silu", id="fp16-w2-cl"),
     pytest.param(torch.float16, 3, 151, True, False, "silu", id="fp16-w3-cl"),
     pytest.param(torch.float16, 4, 8, False, False, "silu", id="fp16-w4-contig"),
+    pytest.param(torch.float16, 4, 151, True, True, None, id="fp16-w4-cl"),
     pytest.param(torch.float16, 5, 151, True, True, None, id="fp16-w5-cl"),
     pytest.param(torch.float16, 6, 1024, False, False, "silu", id="fp16-w6"),
     pytest.param(torch.float16, 7, 1024, True, True, None, id="fp16-w7-cl"),
@@ -129,15 +131,19 @@ _VARLEN_CASES = [
     pytest.param(torch.float16, 9, 1024, True, False, "silu", id="fp16-w9-cl"),
     pytest.param(torch.bfloat16, 2, 151, True, False, None, id="bf16-w2-cl"),
     pytest.param(torch.bfloat16, 3, 8, False, True, "silu", id="bf16-w3"),
+    pytest.param(torch.bfloat16, 3, 151, True, False, "silu", id="bf16-w3-cl"),
     pytest.param(torch.bfloat16, 4, 151, True, True, "silu", id="bf16-w4-cl"),
     pytest.param(torch.bfloat16, 5, 8, False, False, None, id="bf16-w5"),
+    pytest.param(torch.bfloat16, 5, 151, True, True, None, id="bf16-w5-cl"),
     pytest.param(torch.bfloat16, 6, 1024, True, True, "silu", id="bf16-w6-cl"),
     pytest.param(torch.bfloat16, 7, 1024, False, False, None, id="bf16-w7"),
     pytest.param(torch.bfloat16, 8, 1024, True, False, "silu", id="bf16-w8-cl"),
     pytest.param(torch.bfloat16, 9, 1024, False, True, "silu", id="bf16-w9"),
     pytest.param(torch.float32, 2, 8, False, False, "silu", id="fp32-w2"),
+    pytest.param(torch.float32, 2, 151, True, True, None, id="fp32-w2-cl"),
     pytest.param(torch.float32, 3, 151, True, True, None, id="fp32-w3-cl"),
     pytest.param(torch.float32, 4, 8, False, True, "silu", id="fp32-w4"),
+    pytest.param(torch.float32, 4, 151, True, False, "silu", id="fp32-w4-cl"),
     pytest.param(torch.float32, 5, 151, True, False, "silu", id="fp32-w5-cl"),
 ]
 
