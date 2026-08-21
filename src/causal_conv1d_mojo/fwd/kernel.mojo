@@ -18,6 +18,10 @@ Design (matches upstream's tri-dao kernel):
 - With packed sequences plus initial states, virtual positions before
   t=0 carry `seq_idx[b, 0]`; the ordinary id gate therefore exposes the
   initial state only to the first packed sequence in each batch row.
+- The channel-last kernel carries the same (W-1)-row seq_idx halo beside
+  its register x halo. Row-id loads are warp broadcasts (every lane asks
+  for the same address), so packed inputs keep the coalesced channel
+  vectors and four-row walk of the non-packed fast path.
 
 This replaces the old design that had grid = (chunks, dim, batch): each
 chunk-block re-loaded weights/bias and re-read its left-halo from
@@ -364,6 +368,7 @@ def fwd_channellast_kernel[
     dtype: DType,
     kWidth: Int,
     has_bias: Bool,
+    has_seq_idx: Bool,
     has_initial_states: Bool,
     apply_silu: Bool,
 ](
@@ -373,6 +378,7 @@ def fwd_channellast_kernel[
     x_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     w_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     bias_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    seq_idx_ptr: UnsafePointer[Int32, MutAnyOrigin],
     initial_states_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     o_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     x_b_stride: UInt32,
@@ -380,6 +386,8 @@ def fwd_channellast_kernel[
     w_c_stride: UInt32,
     o_b_stride: UInt32,
     o_l_stride: UInt32,
+    seq_idx_b_stride: UInt32,
+    seq_idx_l_stride: UInt32,
     is_b_stride: UInt32,
     is_c_stride: UInt32,
     is_l_stride: UInt32,
@@ -398,19 +406,23 @@ def fwd_channellast_kernel[
     x/out are each touched exactly once per element — the roofline
     minimum. The (W-1) halo rows before the chunk are re-read from
     global (or `initial_states` / zero before t=0), matching upstream's
-    halo-by-reload approach.
+    halo-by-reload approach. With packed sequences, the matching row-id
+    halo travels beside x: a tap contributes only when its id equals the
+    output row's id, padding ids produce zero, and negative-time rows use
+    `seq_idx[b, 0]` only when initial states are present.
 
     Dispatch preconditions (gated in `_jit.py`): dim, x/out batch and
     seqlen strides are all multiples of kNElts (so every vector access
-    is 16-byte aligned), weight is width-contiguous, and no seq_idx
-    (varlen falls back to the generic strided path).
+    is 16-byte aligned), and weight is width-contiguous. seq_idx is made
+    contiguous by `_fn.py`; its explicit strides are still honoured.
 
     `rows_per_block` is runtime, chosen by the launcher: 64 rows when
-    the grid is already wide enough, halving down to 8 for small shapes
-    where (batch x C-chunks x L-chunks) would otherwise leave the GPU
-    latency-starved. The trade is halo re-reads ((W-1)/rows extra x
-    traffic) against occupancy — at small shapes the kernel is latency-
-    bound, not bandwidth-bound, so more blocks win.
+    the grid is already wide enough, halving to a backend-specific floor
+    (4 on discrete GPUs, 8 on Metal) for small shapes where (batch x
+    C-chunks x L-chunks) would otherwise leave the GPU latency-starved.
+    The trade is halo re-reads ((W-1)/rows extra x traffic) against
+    occupancy — at small shapes the kernel is latency-bound, not
+    bandwidth-bound, so more blocks win.
 
     Raw pointers + UInt32 strides instead of TileTensor: same rationale
     as `update/kernel.mojo` — with every stride dynamic there is nothing
@@ -504,6 +516,7 @@ def fwd_channellast_kernel[
     var window = InlineArray[SIMD[accum_t, kNElts], kWidth - 1](
         fill=SIMD[accum_t, kNElts](0)
     )
+    var seq_window = InlineArray[Int32, kWidth - 1](fill=-1)
 
     comptime for j in range(kWidth - 1):
         var l_h: Int = l0 - (kWidth - 1) + j
@@ -523,6 +536,22 @@ def fwd_channellast_kernel[
                         + (c0 + i) * Int(is_c_stride)
                         + (l_h + kWidth - 1) * Int(is_l_stride)
                     ].cast[accum_t]()
+
+        comptime if has_seq_idx:
+            if l_h >= 0:
+                # Every lane in a warp loads the same row id, which the
+                # GPU services as a broadcast transaction. It then stays
+                # in registers for the same lifetime as `window[j]`.
+                seq_window[j] = seq_idx_ptr[
+                    batch_id * Int(seq_idx_b_stride)
+                    + l_h * Int(seq_idx_l_stride)
+                ]
+            else:
+
+                comptime if has_initial_states:
+                    seq_window[j] = seq_idx_ptr[
+                        batch_id * Int(seq_idx_b_stride)
+                    ]
 
     # ---- Walk the chunk's rows; slide the halo in registers ----
     # Unrolled by kUnroll: each iteration issues kUnroll *independent*
@@ -545,6 +574,7 @@ def fwd_channellast_kernel[
         var xv = InlineArray[SIMD[accum_t, kNElts], kUnroll](
             fill=SIMD[accum_t, kNElts](0)
         )
+        var seqv = InlineArray[Int32, kUnroll](fill=-1)
 
         comptime for u in range(kUnroll):
             xv[u] = (
@@ -553,8 +583,18 @@ def fwd_channellast_kernel[
                 .cast[accum_t]()
             )
 
+            comptime if has_seq_idx:
+                seqv[u] = seq_idx_ptr[
+                    batch_id * Int(seq_idx_b_stride)
+                    + (l + u) * Int(seq_idx_l_stride)
+                ]
+
         comptime for u in range(kUnroll):
             var acc = bias_vec
+            var cur_id: Int32 = 0
+
+            comptime if has_seq_idx:
+                cur_id = seqv[u]
 
             comptime for j in range(kWidth):
                 # Tap j of output row (l+u) reads input row
@@ -563,14 +603,30 @@ def fwd_channellast_kernel[
                 # iteration's fresh rows.
                 comptime s = u - (kWidth - 1) + j
                 comptime if s < 0:
-                    acc = w_vecs[j].fma(window[kWidth - 1 + s], acc)
+
+                    comptime if has_seq_idx:
+                        if seq_window[kWidth - 1 + s] == cur_id:
+                            acc = w_vecs[j].fma(
+                                window[kWidth - 1 + s], acc
+                            )
+                    else:
+                        acc = w_vecs[j].fma(window[kWidth - 1 + s], acc)
                 else:
-                    acc = w_vecs[j].fma(xv[s], acc)
+
+                    comptime if has_seq_idx:
+                        if seqv[s] == cur_id:
+                            acc = w_vecs[j].fma(xv[s], acc)
+                    else:
+                        acc = w_vecs[j].fma(xv[s], acc)
 
             comptime if apply_silu:
 
                 comptime for i in range(kNElts):
                     acc[i] = _silu_f32(Float32(acc[i]))
+
+            comptime if has_seq_idx:
+                if cur_id < 0:
+                    acc = 0
 
             (o_base + (l + u) * Int(o_l_stride)).store[alignment=16](
                 acc.cast[dtype]()
@@ -578,6 +634,9 @@ def fwd_channellast_kernel[
 
         comptime for j in range(kWidth - 1):
             window[j] = xv[kUnroll - (kWidth - 1) + j]
+
+            comptime if has_seq_idx:
+                seq_window[j] = seqv[kUnroll - (kWidth - 1) + j]
         l += kUnroll
 
     # Remainder rows (< kUnroll of them), one at a time.
@@ -589,9 +648,25 @@ def fwd_channellast_kernel[
         )
 
         var acc = bias_vec
+        var cur_id: Int32 = 0
+
+        comptime if has_seq_idx:
+            cur_id = seq_idx_ptr[
+                batch_id * Int(seq_idx_b_stride)
+                + l * Int(seq_idx_l_stride)
+            ]
 
         comptime for j in range(kWidth - 1):
-            acc = w_vecs[j].fma(window[j], acc)
+
+            comptime if has_seq_idx:
+                if seq_window[j] == cur_id:
+                    acc = w_vecs[j].fma(window[j], acc)
+            else:
+                acc = w_vecs[j].fma(window[j], acc)
+
+        # x_now and the output row are the same position, so their ids
+        # necessarily match (including padding, which is zeroed after
+        # bias/silu below).
         acc = w_vecs[kWidth - 1].fma(x_now, acc)
 
         comptime if apply_silu:
@@ -599,11 +674,21 @@ def fwd_channellast_kernel[
             comptime for i in range(kNElts):
                 acc[i] = _silu_f32(Float32(acc[i]))
 
+        comptime if has_seq_idx:
+            if cur_id < 0:
+                acc = 0
+
         (o_base + l * Int(o_l_stride)).store[alignment=16](
             acc.cast[dtype]()
         )
 
         comptime for j in range(kWidth - 2):
             window[j] = window[j + 1]
+
+            comptime if has_seq_idx:
+                seq_window[j] = seq_window[j + 1]
         window[kWidth - 2] = x_now
+
+        comptime if has_seq_idx:
+            seq_window[kWidth - 2] = cur_id
         l += 1
