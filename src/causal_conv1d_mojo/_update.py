@@ -81,7 +81,18 @@ def causal_conv1d_update(
     # Apple GPUs. Ref handles both 2-D and 3-D x internally. Only safe
     # when conv_state_indices is None (ref doesn't support paged caches)
     # and dim > 0 (F.conv1d rejects groups=0).
-    if x.device.type == "mps" and conv_state_indices is None:
+    #
+    # Mixed dtypes stay on the Mojo path: `causal_conv1d_update_ref`
+    # mirrors upstream and rounds the history through `weight.dtype`
+    # before the taps, while the kernel widens x and the parameters to
+    # fp32 independently. (The retained state is unaffected either way —
+    # ref shifts it before the arithmetic cast.) Routing a narrower-weight
+    # call here would change the output either side of the threshold.
+    if (
+        x.device.type == "mps"
+        and conv_state_indices is None
+        and weight.dtype == x.dtype
+    ):
         # x is (B, D) or (B, D, L); D and the element count are what
         # gate the fallback, and ref handles both ranks.
         x_shape = x.shape

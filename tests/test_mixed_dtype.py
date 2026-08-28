@@ -428,3 +428,55 @@ def test_state_dtypes_follow_input():
     wrong_state = torch.randn(1, 8, 3, dtype=torch.float32)
     with pytest.raises(NotImplementedError, match="conv_state.dtype"):
         causal_conv1d_update(x[..., 0], wrong_state, weight)
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="MPS fast path requires an Apple GPU"
+)
+@pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
+def test_mps_small_shape_fallback_skipped_for_mixed_dtypes(x_dtype):
+    """A mixed-dtype call must not change answer across the size threshold.
+
+    Below `_MPS_FWD_FALLBACK_THRESHOLD` the wrapper normally hands off to
+    `causal_conv1d_ref`, which mirrors upstream in rounding x through
+    `weight.dtype` before convolving; the kernels widen x and the
+    parameters to fp32 independently. Those agree only when the dtypes
+    match, so the fast path is gated on `weight.dtype == x.dtype`. With
+    weights *narrower* than x the fallback would lose ~1e-3 relative,
+    which the fp32 tolerance below catches.
+    """
+    B, D, L, W = 1, 64, 128, 4
+    assert B * D * L < 4 * 1024 * 1024, "shape must be inside the fallback window"
+    weight_dtype = torch.float16
+
+    x = torch.randn(B, D, L, dtype=x_dtype)
+    weight = torch.randn(D, W, dtype=weight_dtype)
+    bias = torch.randn(D, dtype=weight_dtype)
+
+    got = causal_conv1d_fn(
+        x.to("mps"), weight.to("mps"), bias=bias.to("mps"), activation="silu"
+    ).cpu()
+    expected = causal_conv1d_fn(x, weight, bias=bias, activation="silu")
+
+    diff = _max_diff(got, expected)
+    assert diff < _FWD_TOL[x_dtype], (
+        f"mps mixed-dtype fwd took the rounding fallback: max_diff={diff:.3e}"
+    )
+
+    # Same gate on the decode path.
+    conv_state = torch.randn(B, D, W - 1, dtype=x_dtype)
+    tok = torch.randn(B, D, dtype=x_dtype)
+    got_u = causal_conv1d_update(
+        tok.to("mps"),
+        conv_state.clone().to("mps"),
+        weight.to("mps"),
+        bias=bias.to("mps"),
+        activation="silu",
+    ).cpu()
+    expected_u = causal_conv1d_update(
+        tok, conv_state.clone(), weight, bias=bias, activation="silu"
+    )
+    diff_u = _max_diff(got_u, expected_u)
+    assert diff_u < _FWD_TOL[x_dtype], (
+        f"mps mixed-dtype update took the rounding fallback: max_diff={diff_u:.3e}"
+    )

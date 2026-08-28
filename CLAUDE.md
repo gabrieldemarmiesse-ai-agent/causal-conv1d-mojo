@@ -818,7 +818,13 @@ on H100 fp16 to ~1.0-1.3× on the same shapes):
    When `wdtype == dtype`, pointer
    types and vector alignments resolve to the previous specialization,
    so the same-dtype instruction path and fwd↔update bit-exactness
-   contract are unchanged.
+   contract are unchanged. The MPS small-shape fast paths in `_fn.py` /
+   `_update.py` are gated on `weight.dtype == x.dtype`: they hand off to
+   `causal_conv1d_ref`, which mirrors upstream in rounding x through
+   `weight.dtype` (`x = x.to(weight.dtype)`) before convolving, whereas
+   the kernels widen x and the parameters to fp32 independently. Those
+   agree only while the dtypes match, so a mixed-dtype call must not
+   change answer either side of the size threshold.
 
 ## CPU kernel design (`fwd_cpu/`, `bwd_full_cpu/`, `update_cpu/`)
 

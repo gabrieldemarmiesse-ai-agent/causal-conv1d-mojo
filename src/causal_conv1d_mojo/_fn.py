@@ -511,7 +511,14 @@ def causal_conv1d_fn(
     # messages than the wrapper would give). Packed-sequence calls stay
     # on the Mojo path; dim must be positive because F.conv1d rejects
     # groups=0.
-    if x.device.type == "mps" and seq_idx is None:
+    #
+    # Mixed dtypes stay on the Mojo path too. `causal_conv1d_ref` mirrors
+    # upstream's reference, which rounds x through `weight.dtype` before
+    # convolving (`x = x.to(weight.dtype)`); the kernels instead widen x
+    # and the parameters to fp32 independently. Those agree only while the
+    # dtypes match, so routing a narrower-weight call here would make the
+    # same arguments give a different answer either side of the threshold.
+    if x.device.type == "mps" and seq_idx is None and weight.dtype == x.dtype:
         B, D, L = x.shape
         if D > 0 and 0 < B * D * L < _MPS_FWD_FALLBACK_THRESHOLD:
             return causal_conv1d_ref(
