@@ -53,6 +53,7 @@ def _use_deterministic_mode() -> bool:
         return False
     return torch.are_deterministic_algorithms_enabled()
 
+
 def _sequence_rows_are_16b_aligned(x: torch.Tensor) -> bool:
     """Whether every (batch, channel) row has a 16-byte-aligned base."""
     element_size = x.element_size()
@@ -259,8 +260,8 @@ class _CausalConv1dFn(torch.autograd.Function):
     """fp16/bf16/fp32 autograd op (CUDA + CPU).
 
     Widths: 2..9 for fp16/bf16, 2..5 for fp32; backward additionally
-    requires seqlen aligned to 1024 and 16-byte-aligned x rows when
-    width > 5.
+    requires seqlen aligned to 1024 when width > 5, plus 16-byte-aligned
+    x rows when x is seqlen-contiguous.
 
     Dispatches to the GPU launcher when `x.is_cuda`, otherwise to the
     pure-mojo CPU launcher (parallelized over (B, D) via
@@ -521,13 +522,19 @@ def causal_conv1d_fn(
             f"if you need wider."
         )
     if width > 5 and x.requires_grad:
-        if x.shape[-1] % 1024 != 0 or not _sequence_rows_are_16b_aligned(x):
+        # Mirrors bwd/_jit.py's `use_wide`: the row-alignment proof is
+        # only required on the contiguous-inner path, the one that issues
+        # 16-byte accesses along a row. A strided x (e.g. channel-last)
+        # is read scalar and keeps the wide halo.
+        rows_ok = x.stride(-1) != 1 or _sequence_rows_are_16b_aligned(x)
+        if x.shape[-1] % 1024 != 0 or not rows_ok:
             raise NotImplementedError(
                 f"width > 5 with autograd requires seqlen aligned to 1024 "
-                f"and every x row 16-byte aligned (got seqlen={x.shape[-1]}, "
-                f"width={width}, x.data_ptr()%16={x.data_ptr() % 16}). The "
-                f"bwd halo falls back to a 4-slot ring otherwise. Open an "
-                f"issue if you need this combination."
+                f"and, for seqlen-contiguous x, every row 16-byte aligned "
+                f"(got seqlen={x.shape[-1]}, width={width}, "
+                f"x.data_ptr()%16={x.data_ptr() % 16}). The bwd halo falls "
+                f"back to a 4-slot ring otherwise. Open an issue if you "
+                f"need this combination."
             )
     if x.device != weight.device or (bias is not None and x.device != bias.device):
         raise NotImplementedError(

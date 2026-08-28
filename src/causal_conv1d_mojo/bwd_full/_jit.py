@@ -98,14 +98,22 @@ def _config_from_args(args: tuple) -> tuple:
     # aligned to kNThreads * wide, and (c) every row of every tensor this
     # variant vector-accesses (x, dout, dx) is 16-byte aligned. Otherwise
     # use the narrow, alignment-agnostic variant.
+    #
+    # (c) applies only to the contiguous-inner path: that is the one that
+    # issues 16-byte accesses along a row. A strided x (channel-last, or
+    # any non-unit seqlen stride) is read scalar, so its row bases can't
+    # fault and the wide halo stays available — which is what widths 6..9
+    # need, and what this dispatcher did before the alignment proof was
+    # added.
+    vec_rows_ok = rows_16b_aligned or not contig_inner
     n_elts_wide = _KN_ELTS_WIDE[dtype_code]
     use_wide = (
-        rows_16b_aligned
+        vec_rows_ok
         and n_elts_wide != _KN_ELTS_NARROW
         and (seqlen % (_KNTHREADS * n_elts_wide)) == 0
     )
     n_elts = n_elts_wide if use_wide else _KN_ELTS_NARROW
-    aligned_seq = rows_16b_aligned and (seqlen % (_KNTHREADS * n_elts)) == 0
+    aligned_seq = vec_rows_ok and (seqlen % (_KNTHREADS * n_elts)) == 0
     # See fwd/_jit.py for why this is comptime instead of a runtime
     # branch on `stream_handle_addr`. Python wrapper sets 1 for CUDA,
     # 0 for Metal.
