@@ -62,9 +62,7 @@ def _is_metallib(path: Path) -> bool:
 
 def _function_name(metallib: str) -> str | None:
     """First (only) function symbol in the metallib, via metal-nm."""
-    r = subprocess.run(
-        ["xcrun", "metal-nm", metallib], capture_output=True, text=True
-    )
+    r = subprocess.run(["xcrun", "metal-nm", metallib], capture_output=True, text=True)
     for line in r.stdout.splitlines():
         parts = line.split()
         if len(parts) >= 3 and parts[1] == "T":
@@ -169,7 +167,10 @@ def pipeline_static_facts(metallib: str) -> dict:
     }
     err = ctypes.c_void_p(0)
     lib = _msg(
-        dev, "newLibraryWithURL:error:", _url(metallib), ctypes.byref(err),
+        dev,
+        "newLibraryWithURL:error:",
+        _url(metallib),
+        ctypes.byref(err),
         argtypes=[ctypes.c_void_p, ctypes.c_void_p],
     )
     if not lib:
@@ -183,7 +184,10 @@ def pipeline_static_facts(metallib: str) -> dict:
     func = _msg(lib, "newFunctionWithName:", _nsstr(fn), argtypes=[ctypes.c_void_p])
     err = ctypes.c_void_p(0)
     pso = _msg(
-        dev, "newComputePipelineStateWithFunction:error:", func, ctypes.byref(err),
+        dev,
+        "newComputePipelineStateWithFunction:error:",
+        func,
+        ctypes.byref(err),
         argtypes=[ctypes.c_void_p, ctypes.c_void_p],
     )
     if not pso:
@@ -206,7 +210,8 @@ def air_instruction_histogram(metallib: str) -> dict[str, int]:
     allocation — the Apple analog of a PTX histogram)."""
     txt = subprocess.run(
         ["xcrun", "metal-objdump", "-d", "--arch-name=air64", metallib],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     ).stdout
     ops: Counter = Counter()
     for line in txt.splitlines():
@@ -234,7 +239,10 @@ def extract_native_agx(metallib: str, workdir: str = "/tmp/ccv_agx") -> dict:
     dev = metal.MTLCreateSystemDefaultDevice()
     err = ctypes.c_void_p(0)
     lib = _msg(
-        dev, "newLibraryWithURL:error:", _url(metallib), ctypes.byref(err),
+        dev,
+        "newLibraryWithURL:error:",
+        _url(metallib),
+        ctypes.byref(err),
         argtypes=[ctypes.c_void_p, ctypes.c_void_p],
     )
     if not lib:
@@ -242,26 +250,41 @@ def extract_native_agx(metallib: str, workdir: str = "/tmp/ccv_agx") -> dict:
     names = _msg(lib, "functionNames")
     fn = _to_str(_msg(names, "objectAtIndex:", 0, argtypes=[ctypes.c_ulong]))
     func = _msg(lib, "newFunctionWithName:", _nsstr(fn), argtypes=[ctypes.c_void_p])
-    desc = _msg(_msg(_init_objc().objc_getClass(b"MTLBinaryArchiveDescriptor"), "alloc"), "init")
+    desc = _msg(
+        _msg(_init_objc().objc_getClass(b"MTLBinaryArchiveDescriptor"), "alloc"), "init"
+    )
     err = ctypes.c_void_p(0)
     archive = _msg(
-        dev, "newBinaryArchiveWithDescriptor:error:", desc, ctypes.byref(err),
+        dev,
+        "newBinaryArchiveWithDescriptor:error:",
+        desc,
+        ctypes.byref(err),
         argtypes=[ctypes.c_void_p, ctypes.c_void_p],
     )
-    cpd = _msg(_msg(_init_objc().objc_getClass(b"MTLComputePipelineDescriptor"), "alloc"), "init")
+    cpd = _msg(
+        _msg(_init_objc().objc_getClass(b"MTLComputePipelineDescriptor"), "alloc"),
+        "init",
+    )
     _msg(cpd, "setComputeFunction:", func, argtypes=[ctypes.c_void_p])
     err = ctypes.c_void_p(0)
     if not _msg(
-        archive, "addComputePipelineFunctionsWithDescriptor:error:", cpd,
-        ctypes.byref(err), restype=ctypes.c_bool,
+        archive,
+        "addComputePipelineFunctionsWithDescriptor:error:",
+        cpd,
+        ctypes.byref(err),
+        restype=ctypes.c_bool,
         argtypes=[ctypes.c_void_p, ctypes.c_void_p],
     ):
         return {"error": "addComputePipelineFunctions failed"}
     fat = f"{workdir}.archive"
     err = ctypes.c_void_p(0)
     if not _msg(
-        archive, "serializeToURL:error:", _url(fat), ctypes.byref(err),
-        restype=ctypes.c_bool, argtypes=[ctypes.c_void_p, ctypes.c_void_p],
+        archive,
+        "serializeToURL:error:",
+        _url(fat),
+        ctypes.byref(err),
+        restype=ctypes.c_bool,
+        argtypes=[ctypes.c_void_p, ctypes.c_void_p],
     ):
         return {"error": "serializeToURL failed"}
     info = subprocess.run(
@@ -278,7 +301,8 @@ def extract_native_agx(metallib: str, workdir: str = "/tmp/ccv_agx") -> dict:
     )
     sec = subprocess.run(
         ["xcrun", "metal-objdump", "--section-headers", thin],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     ).stdout
     # The lipo-thinned applegpu slice exposes the native code as a
     # __compute section (a nested Mach-O whose own __text is the real
@@ -346,13 +370,19 @@ def _print_human(rep: dict) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("metallib", nargs="?", help="path to a .metallib")
-    ap.add_argument("--fn", choices=("fwd", "bwd", "update"), help="find newest cached kernel for this fn")
+    ap.add_argument(
+        "--fn",
+        choices=("fwd", "bwd", "update"),
+        help="find newest cached kernel for this fn",
+    )
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
     mll = args.metallib or find_kernel_metallib(args.fn)
     if not mll:
-        print("no metallib found (run the kernel first, or pass a path)", file=sys.stderr)
+        print(
+            "no metallib found (run the kernel first, or pass a path)", file=sys.stderr
+        )
         return 1
     rep = introspect(mll)
     if args.json:
