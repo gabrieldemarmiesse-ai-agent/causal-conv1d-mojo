@@ -141,10 +141,7 @@ def revive_heaps(*tensors: torch.Tensor | None) -> None:
     now = time.monotonic()
     if _REVIVE_MODE != "always":
         stamps = _revive_stamp
-        if all(
-            now - stamps.get(t.data_ptr(), 0.0) < _REVIVE_WINDOW_S
-            for t in live
-        ):
+        if all(now - stamps.get(t.data_ptr(), 0.0) < _REVIVE_WINDOW_S for t in live):
             return
     groups: dict[torch.dtype, list[torch.Tensor]] = {}
     for t in live:
