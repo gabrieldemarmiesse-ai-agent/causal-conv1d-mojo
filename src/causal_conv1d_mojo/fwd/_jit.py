@@ -109,10 +109,9 @@ def _config_from_args(args: tuple) -> tuple:
     # gets after .transpose(1, 2), i.e. upstream's `is_channel_last`
     # condition. The dedicated kernel vectorizes along dim, so dim and
     # the non-contiguous strides of x/out must all be multiples of
-    # kNElts to keep every 16-byte access aligned. seq_idx stays on the
-    # generic path (v1 scope; mirrors it being the rarer case here —
-    # note upstream is the opposite: their seq_idx REQUIRES
-    # channel-last).
+    # kNElts to keep every 16-byte access aligned. Packed seq_idx uses
+    # the same fast path: the kernel carries row ids beside its x halo,
+    # matching upstream's requirement that seq_idx inputs be channel-last.
     kn = _KN_ELTS[dtype_code]
     channel_last = (
         # The unrolled row walk carries the halo in xv registers, which
@@ -125,7 +124,6 @@ def _config_from_args(args: tuple) -> tuple:
         and args[13] == 1  # out dim-contiguous
         and args[14] > 1
         and args[11] == 1  # weight width-contiguous
-        and not has_seq_idx
         and args[5] % kn == 0  # dim
         and args[7] % kn == 0  # x batch stride
         and args[9] % kn == 0  # x seqlen stride

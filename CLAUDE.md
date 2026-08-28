@@ -715,6 +715,18 @@ on H100 fp16 to ~1.0-1.3× on the same shapes):
    `width <= 5` — the
    unrolled walk carries the halo in `kUnroll = 4` registers, so wider
    fp16/bf16 filters (we support up to 9) stay on the generic kernel.
+   within ~8% of the seqlen-contiguous kernel there. Packed seq_idx now
+   uses this path: a `(W-1)` row-id halo travels beside the x register
+   halo, and the four fresh ids are loaded with the four fresh x rows.
+   Every lane requests the same id address, so those reads are warp
+   broadcasts rather than per-channel memory traffic. On H100 this is
+   12.9 µs vs upstream's 23.9 µs at `(1,4096,2048,4)` fp16 (1.08× our
+   own 11.9 µs non-seq_idx time); the former generic route was 208 µs.
+   The dispatch gate also requires 16B-aligned x/out/bias base pointers
+   (conforming strides alone don't guarantee alignment for the 16-byte
+   vector accesses) and `width <= 5` — the unrolled walk carries the
+   halo in `kUnroll = 4` registers, so wider fp16/bf16 filters (we
+   support up to 9) stay on the generic kernel.
    Grid is `(L-chunks, batch, C-chunks)`: L-chunks is the only axis
    that can blow past CUDA's 65535 grid.y/z cap (seqlen 4.2M+), so it
    rides grid.x. Known gap: one tiny latency-bound shape
@@ -742,6 +754,9 @@ on H100 fp16 to ~1.0-1.3× on the same shapes):
    the taps are scalar-loaded with `w_w_stride`. The short linear-state
    vector load is used only for `state_l_stride == 1`; strided conv-state
    views take scalar history loads.
+   unsupported. Eligible channel-last forward inputs use the dedicated
+   kernel above; contiguous, wide-filter, dim-tail, or unaligned cases
+   retain the generic strided GPU fallback. Backward remains generic.
 
 ## CPU kernel design (`fwd_cpu/`, `bwd_full_cpu/`, `update_cpu/`)
 

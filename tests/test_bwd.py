@@ -237,7 +237,10 @@ def test_initial_states_backward(device, dtype, width, bias_present):
 @pytest.mark.parametrize(
     "seq_idx_pattern", ["single", "two_equal", "varied", "with_padding"]
 )
-def test_seq_idx_backward(device, dtype, seq_idx_pattern, activation, bias_present):
+@pytest.mark.parametrize("channel_last", [False, True], ids=["contig", "channel_last"])
+def test_seq_idx_backward(
+    device, dtype, seq_idx_pattern, activation, bias_present, channel_last
+):
     """Backward through seq_idx: dx/dw/db match the segmented reference.
 
     For each seq_idx run, only positions in that run contributed to
@@ -246,7 +249,15 @@ def test_seq_idx_backward(device, dtype, seq_idx_pattern, activation, bias_prese
     flow.
     """
     B, D, L, W = 2, 16, 64, 4
-    x = torch.randn(B, D, L, dtype=dtype, device=device, requires_grad=True)
+    if channel_last:
+        x = (
+            torch.randn(B, L, D, dtype=dtype, device=device)
+            .transpose(1, 2)
+            .requires_grad_()
+        )
+        assert x.stride(1) == 1 and x.stride(2) != 1
+    else:
+        x = torch.randn(B, D, L, dtype=dtype, device=device, requires_grad=True)
     weight = torch.randn(D, W, dtype=dtype, device=device, requires_grad=True)
     bias = _make_bias(
         D, dtype=dtype, device=device, present=bias_present, requires_grad=True
