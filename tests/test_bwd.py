@@ -136,6 +136,47 @@ def test_final_states_backward(device, dtype, width, bias_present):
         _assert_dw_close(bias.grad, db_ref, dtype, name="db")
 
 
+@pytest.mark.parametrize("seqlen", [0, 1, 2])
+def test_final_states_backward_short_seqlen_with_initial_states(device, dtype, seqlen):
+    """seqlen < W-1 with initial_states: final_states copies
+    `initial_states[..., seqlen:]` into its first W-1-seqlen slots, so
+    dfinal_states must flow into dinitial_states there (upstream's
+    `dxinit_vals[i] += dfinal_states[i - seqlen]`), and into dx's tail
+    for the rest.
+    """
+    from causal_conv1d_mojo import causal_conv1d_ref
+
+    B, D, W = 2, 16, 4
+    x = torch.randn(B, D, seqlen, dtype=dtype, device=device, requires_grad=True)
+    weight = torch.randn(D, W, dtype=dtype, device=device, requires_grad=True)
+    init = torch.randn(B, D, W - 1, dtype=dtype, device=device, requires_grad=True)
+    dout = torch.randn(B, D, seqlen, dtype=dtype, device=device)
+    dfs = torch.randn(B, D, W - 1, dtype=dtype, device=device)
+
+    out, fs = causal_conv1d_mojo.causal_conv1d_fn(
+        x, weight, initial_states=init, activation="silu", return_final_states=True
+    )
+    torch.autograd.backward([out, fs], [dout, dfs])
+
+    # Reference: conv over cat([init, x]) + the state window, autograd.
+    x_ref = x.detach().clone().requires_grad_()
+    w_ref = weight.detach().clone().requires_grad_()
+    init_ref = init.detach().clone().requires_grad_()
+    full = torch.cat([init_ref, x_ref], dim=-1)
+    out_ref = causal_conv1d_ref(full, w_ref, activation="silu")[..., W - 1 :]
+    fs_ref = full[..., -(W - 1) :]
+    torch.autograd.backward([out_ref, fs_ref], [dout, dfs])
+
+    assert _max_diff(init.grad, init_ref.grad) < _DX_TOL[dtype], (
+        f"dinit max_diff={_max_diff(init.grad, init_ref.grad)}"
+    )
+    if seqlen > 0:
+        assert _max_diff(x.grad, x_ref.grad) < _DX_TOL[dtype], (
+            f"dx max_diff={_max_diff(x.grad, x_ref.grad)}"
+        )
+    _assert_dw_close(weight.grad, w_ref.grad, dtype, name="dw")
+
+
 # ===---------- initial_states backward ----------=== #
 
 

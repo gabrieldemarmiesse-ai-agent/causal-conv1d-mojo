@@ -234,6 +234,67 @@ def test_final_states_short_seqlen(device, dtype):
     assert _max_diff(fs[..., pad:], x) == 0.0
 
 
+@pytest.mark.parametrize("seqlen", [0, 1, 2])
+def test_final_states_short_seqlen_with_initial_states(device, dtype, seqlen):
+    """seqlen < W-1 with initial_states: the new state is the last W-1
+    of `[initial_states, x]` (upstream's kernel + ref), not a zero-padded
+    copy of x — a decode loop feeding a token at a time must not forget
+    the older tokens held in the previous state.
+    """
+    from causal_conv1d_mojo import causal_conv1d_ref
+
+    B, D, W = 2, 16, 4
+    x = torch.randn(B, D, seqlen, dtype=dtype, device=device)
+    weight = torch.randn(D, W, dtype=dtype, device=device)
+    init = torch.randn(B, D, W - 1, dtype=dtype, device=device)
+
+    out, fs = causal_conv1d_mojo.causal_conv1d_fn(
+        x, weight, initial_states=init, activation="silu", return_final_states=True
+    )
+
+    # Pure data movement: exact.
+    expected_fs = torch.cat([init, x], dim=-1)[..., -(W - 1) :]
+    assert _max_diff(fs, expected_fs) == 0.0
+    if seqlen > 0:
+        # (The pure-torch ref can't run F.conv1d on an empty x.)
+        out_ref, fs_ref = causal_conv1d_ref(
+            x, weight, initial_states=init, activation="silu", return_final_states=True
+        )
+        assert _max_diff(fs, fs_ref) == 0.0
+        assert _max_diff(out, out_ref) < _FWD_TOL[dtype]
+
+
+def test_final_states_short_seqlen_matches_upstream_cuda():
+    """Cross-check the short-chunk state semantics against upstream's
+    CUDA kernel (which only supports final/initial states in channel-last
+    layout)."""
+    pytest.importorskip("causal_conv1d")
+    if not torch.cuda.is_available():
+        pytest.skip("needs cuda")
+    from causal_conv1d import causal_conv1d_fn as upstream_fn
+
+    def channel_last(t):
+        return t.transpose(1, 2).contiguous().transpose(1, 2)
+
+    # seqlen=2 only: a size-1 seqlen dim has stride 1 in torch, which
+    # upstream's C++ classifies as *not* channel-last and then rejects
+    # (initial_states need channel-last there). Ours accepts both.
+    B, D, W = 2, 64, 4
+    weight = torch.randn(D, W, dtype=torch.float16, device="cuda")
+    for seqlen in (2,):
+        x = channel_last(torch.randn(B, D, seqlen, dtype=torch.float16, device="cuda"))
+        init = channel_last(
+            torch.randn(B, D, W - 1, dtype=torch.float16, device="cuda")
+        )
+        _, fs = causal_conv1d_mojo.causal_conv1d_fn(
+            x, weight, initial_states=init, activation="silu", return_final_states=True
+        )
+        _, fs_up = upstream_fn(
+            x, weight, initial_states=init, activation="silu", return_final_states=True
+        )
+        assert _max_diff(fs, fs_up) == 0.0, f"seqlen={seqlen}"
+
+
 # ===---------- initial_states (chunked stateful execution) ----------=== #
 
 
@@ -289,6 +350,53 @@ def test_initial_states_chunked_roundtrip(device, dtype, bias_present):
 
     diff = _max_diff(full_out, chunked_out)
     assert diff < _FWD_TOL[dtype], f"chunked vs full max_diff={diff}"
+
+
+@pytest.mark.parametrize(
+    "chunk_sizes", [[1] * 16, [1, 2, 1, 3, 4, 1, 4], [2, 1, 8, 4, 1]]
+)
+def test_initial_states_chunked_roundtrip_short_chunks(device, dtype, chunk_sizes):
+    """Same roundtrip with chunks shorter than W-1 (decode-style, one or
+    two tokens per call): the carried state must include the tail of the
+    *previous* state, not zeros, or every short chunk forgets history.
+
+    Chunks are passed as contiguous copies, every chunk length is in
+    {1, 2, 3, 4, 8} and the total is 16: the CUDA generic kernel
+    currently faults (misaligned address) on seqlen-slices whose row base
+    isn't 16-byte aligned and on contiguous rows with
+    `seqlen > kNElts and seqlen * sizeof(dtype) % 16 != 0` (fixed
+    separately from this state fix).
+    """
+    B, D, W = 1, 16, 4
+    L = sum(chunk_sizes)
+    x = torch.randn(B, D, L, dtype=dtype, device=device)
+    weight = torch.randn(D, W, dtype=dtype, device=device)
+    bias = torch.randn(D, dtype=dtype, device=device)
+
+    full_out = causal_conv1d_mojo.causal_conv1d_fn(
+        x, weight, bias=bias, activation="silu"
+    )
+
+    init = None
+    chunked_outs = []
+    start = 0
+    for n in chunk_sizes:
+        out_c, init = causal_conv1d_mojo.causal_conv1d_fn(
+            x[..., start : start + n].contiguous(),
+            weight,
+            bias=bias,
+            initial_states=init,
+            return_final_states=True,
+            activation="silu",
+        )
+        chunked_outs.append(out_c)
+        start += n
+    chunked_out = torch.cat(chunked_outs, dim=-1)
+
+    diff = _max_diff(full_out, chunked_out)
+    assert diff < _FWD_TOL[dtype], f"chunked vs full max_diff={diff}"
+    # The final carried state is the last W-1 tokens of x, exactly.
+    assert _max_diff(init, x[..., -(W - 1) :]) == 0.0
 
 
 def test_initial_states_mutual_exclusion_with_seq_idx():

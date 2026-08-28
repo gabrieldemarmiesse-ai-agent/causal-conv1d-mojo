@@ -6,8 +6,9 @@ GPU kernels (`fwd` + `bwd_full` subpackages) when `x.is_cuda` and to
 the CPU kernels otherwise; `bias` may be None on either path.
 
 `final_states_out`, when provided, is written in-place with the last
-`W-1` cols of `x` (left zero-padded if `seqlen < W-1`); the backward
-adds `dfinal_states` into the matching slice of `dx`.
+`W-1` cols of `[initial_states, x]` (or of `x` left zero-padded when
+there are no initial states and `seqlen < W-1`); the backward adds
+`dfinal_states` into the matching slices of `dx` and `dinitial_states`.
 """
 
 from __future__ import annotations
@@ -29,22 +30,35 @@ _MPS_FWD_FALLBACK_THRESHOLD = 4 * 1024 * 1024
 
 
 def _write_final_states(
-    x: torch.Tensor, final_states_out: torch.Tensor, width: int
+    x: torch.Tensor,
+    initial_states: torch.Tensor | None,
+    final_states_out: torch.Tensor,
+    width: int,
 ) -> None:
-    """`final_states_out[b, c, i]` is the value of `x[b, c, t]` at the
-    `width-1` most-recent positions, left zero-padded if `seqlen <
-    width-1`. Used by the chunked / stateful execution path: feed
-    `final_states_out` of chunk `i` as `initial_states` of chunk `i+1`.
+    """`final_states_out[b, c, :]` is the last `width-1` positions of the
+    full history `[initial_states, x]` along seqlen — i.e. the conv state
+    after consuming `x`. Used by the chunked / stateful execution path:
+    feed `final_states_out` of chunk `i` as `initial_states` of chunk
+    `i+1`, for chunks of *any* length (a decode loop feeding one token at
+    a time with W=4 still needs the two older tokens from the previous
+    state).
 
-    Mirrors upstream's `F.pad(x, (W-1-seqlen, 0))[..., -W+1:]` slice in
-    `causal_conv1d_ref`.
+    When `seqlen < width-1` the window reaches back into
+    `initial_states[..., seqlen:]`; without initial states the history
+    before `t = 0` is implicit zeros, so the left is zero-padded.
+    Mirrors upstream's ref (`F.pad(cat([init, x]), (W-1-L, 0))[..., -W+1:]`)
+    and its channel-last kernel, whose final-states store reads the smem
+    rows that hold `initial_states` when the slice starts before `t = 0`.
     """
     seqlen = x.shape[-1]
     pad_left = (width - 1) - seqlen
     if pad_left > 0:
-        # x is shorter than W-1: copy all of x into the right portion
-        # and zero the left.
-        final_states_out[..., :pad_left].zero_()
+        # x is shorter than W-1: the older part of the new state is the
+        # tail of the previous state (or zeros when there is none).
+        if initial_states is None:
+            final_states_out[..., :pad_left].zero_()
+        else:
+            final_states_out[..., :pad_left].copy_(initial_states[..., seqlen:])
         final_states_out[..., pad_left:].copy_(x)
     else:
         final_states_out.copy_(x[..., -(width - 1) :])
@@ -96,7 +110,7 @@ def _fwd_inplace_impl(
     else:
         native_fwd_cpu(x, weight, bias, seq_idx, initial_states, out, apply_silu)
     if final_states_out is not None:
-        _write_final_states(x, final_states_out, weight.shape[1])
+        _write_final_states(x, initial_states, final_states_out, weight.shape[1])
 
 
 def _fwd_inplace_fake(
@@ -213,9 +227,11 @@ class _CausalConv1dFn(torch.autograd.Function):
     plumbed through both paths; `bias` may be None.
 
     `final_states_out`, if provided, is written to in-place with the
-    last `W-1` cols of `x` (left zero-padded if seqlen < W-1). The
-    backward adds `dfinal_states` into the corresponding slice of
-    `dx`.
+    last `W-1` cols of `[initial_states, x]` (zero-padded on the left
+    when there are no initial states and seqlen < W-1). The backward
+    adds `dfinal_states` into the corresponding slices of `dx` and, for
+    the part of the window that reached into the previous state,
+    `dinitial_states`.
     """
 
     @staticmethod
@@ -312,13 +328,22 @@ class _CausalConv1dFn(torch.autograd.Function):
         )
 
         if dfinal_states is not None:
-            # final_states[b, c, i] = x[b, c, seqlen - (W-1) + i] for
-            # i s.t. that index is in-range; the rest is zero-padded
-            # and contributes no gradient. So dx gets the matching
-            # tail incremented.
+            # final_states = cat([initial_states, x])[..., -(W-1):]: the
+            # last min(W-1, seqlen) slots are a straight copy of x's
+            # tail, the slots before them (only when seqlen < W-1) copy
+            # initial_states[..., seqlen:], and anything left is the
+            # implicit zero history. So dfinal_states flows straight
+            # into the matching slices of dx and dinitial_states
+            # (upstream's bwd: `dxinit_vals[i] += dfinal_states[i -
+            # seqlen]` for `i >= seqlen`).
             tail = min(W - 1, seqlen)
             if tail > 0:
                 dx[..., -tail:] += dfinal_states[..., -tail:].to(dx.dtype)
+            pad_left = (W - 1) - seqlen
+            if pad_left > 0 and dinitial_states is not None:
+                dinitial_states[..., seqlen:] += dfinal_states[..., :pad_left].to(
+                    dinitial_states.dtype
+                )
 
         dbias = dbias_acc.to(bias.dtype) if has_bias else None
         # Forward input order: (x, weight, bias, seq_idx, initial_states,
