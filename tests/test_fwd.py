@@ -123,11 +123,19 @@ def test_width_forward(device, dtype, width, activation, bias_present):
     assert diff < _FWD_TOL[dtype], f"width={width}, max_diff={diff}"
 
 
-def test_width_seq_idx_forward(device, dtype, width):
+@pytest.mark.parametrize("channel_last", [False, True], ids=["contig", "channel_last"])
+@pytest.mark.parametrize("width", [2, 3, 4, 5], ids=["w2", "w3", "w4", "w5"])
+def test_width_seq_idx_forward(device, dtype, width, channel_last):
     """Packed-sequence forward at every width — guards that the seq_idx
-    mask honours the W-1 lookback correctly for width != 4."""
+    mask honours the W-1 lookback correctly for width != 4. The
+    channel-last cases exercise every width supported by the dedicated
+    kernel; installed upstream comparisons stop at its width-4 limit."""
     B, D, L = 1, 16, 64
-    x = torch.randn(B, D, L, dtype=dtype, device=device)
+    if channel_last:
+        x = torch.randn(B, L, D, dtype=dtype, device=device).transpose(1, 2)
+        assert x.stride(1) == 1 and x.stride(2) != 1
+    else:
+        x = torch.randn(B, D, L, dtype=dtype, device=device)
     weight = torch.randn(D, width, dtype=dtype, device=device)
     seq_idx = torch.cat(
         [
@@ -141,6 +149,12 @@ def test_width_seq_idx_forward(device, dtype, width):
     )
     expected = _ref_with_seq_idx(x, weight, None, seq_idx, None)
     assert _max_diff(out, expected) < _FWD_TOL[dtype]
+
+    if device == "cuda" and channel_last and width <= 4:
+        from causal_conv1d import causal_conv1d_fn as upstream_fwd
+
+        upstream = upstream_fwd(x, weight, seq_idx=seq_idx, activation=None)
+        assert _max_diff(out, upstream) < _FWD_TOL[dtype]
 
 
 def test_width_invalid_raises():
@@ -435,9 +449,16 @@ def test_initial_states_shape_validation():
         "with_padding",
     ],
 )
-def test_seq_idx_forward(device, dtype, seq_idx_pattern, activation, bias_present):
+@pytest.mark.parametrize("channel_last", [False, True], ids=["contig", "channel_last"])
+def test_seq_idx_forward(
+    device, dtype, seq_idx_pattern, activation, bias_present, channel_last
+):
     B, D, L, W = 2, 16, 64, 4
-    x = torch.randn(B, D, L, dtype=dtype, device=device)
+    if channel_last:
+        x = torch.randn(B, L, D, dtype=dtype, device=device).transpose(1, 2)
+        assert x.stride(1) == 1 and x.stride(2) != 1
+    else:
+        x = torch.randn(B, D, L, dtype=dtype, device=device)
     weight = torch.randn(D, W, dtype=dtype, device=device)
     bias = _make_bias(D, dtype=dtype, device=device, present=bias_present)
 
@@ -478,6 +499,55 @@ def test_seq_idx_forward(device, dtype, seq_idx_pattern, activation, bias_presen
     expected = _ref_with_seq_idx(x, weight, bias, seq_idx, activation)
     diff = _max_diff(out, expected)
     assert diff < _FWD_TOL[dtype], f"max_diff={diff}, pattern={seq_idx_pattern}"
+
+    if device == "cuda" and channel_last:
+        from causal_conv1d import causal_conv1d_fn as upstream_fwd
+
+        upstream = upstream_fwd(
+            x, weight, bias=bias, seq_idx=seq_idx, activation=activation
+        )
+        upstream_diff = _max_diff(out, upstream)
+        assert upstream_diff < _FWD_TOL[dtype], (
+            f"upstream max_diff={upstream_diff}, pattern={seq_idx_pattern}"
+        )
+
+
+@pytest.mark.parametrize("dim", [16, 17], ids=["fast_path", "dim_tail_fallback"])
+def test_seq_idx_channel_last_tail_rows(device, dtype, dim):
+    """A partial final row block is correct on both sides of the dim gate.
+
+    D=16 enters the dedicated channel-last kernel for every dtype; D=17
+    is not divisible by either 8 (fp16/bf16) or 4 (fp32), so it must use
+    the generic strided fallback. L=151 is not a multiple of any launcher
+    row-block choice. The middle padding fragment also pins zero output.
+    """
+    B, L, W = 2, 151, 4
+    x = torch.randn(B, L, dim, dtype=dtype, device=device).transpose(1, 2)
+    weight = torch.randn(dim, W, dtype=dtype, device=device)
+    seq_idx = torch.cat(
+        [
+            torch.zeros(B, 37, dtype=torch.int32, device=device),
+            torch.full((B, 11), -1, dtype=torch.int32, device=device),
+            torch.ones(B, L - 48, dtype=torch.int32, device=device),
+        ],
+        dim=1,
+    )
+
+    out = causal_conv1d_mojo.causal_conv1d_fn(
+        x, weight, seq_idx=seq_idx, activation="silu"
+    )
+    expected = _ref_with_seq_idx(x, weight, None, seq_idx, "silu")
+    assert _max_diff(out, expected) < _FWD_TOL[dtype]
+    padding = (seq_idx < 0).unsqueeze(1).expand_as(out)
+    assert torch.count_nonzero(out.masked_select(padding)) == 0
+
+    # Installed upstream rejects dim % 8 != 0 before dispatch; that is
+    # precisely the fallback case we cover against the PyTorch oracle.
+    if device == "cuda" and dim % 8 == 0:
+        from causal_conv1d import causal_conv1d_fn as upstream_fwd
+
+        upstream = upstream_fwd(x, weight, seq_idx=seq_idx, activation="silu")
+        assert _max_diff(out, upstream) < _FWD_TOL[dtype]
 
 
 def test_seq_idx_inference_no_grad(device, dtype):
@@ -574,8 +644,17 @@ def test_fwd_wide_widths_fp16_channel_last(device, W):
     dtype = torch.float16
     x = torch.randn(B, L, D, dtype=dtype, device=device).transpose(1, 2)
     weight = torch.randn(D, W, dtype=dtype, device=device)
-    out = causal_conv1d_mojo.causal_conv1d_fn(x, weight, activation="silu")
-    ref = causal_conv1d_mojo.causal_conv1d_ref(x, weight, activation="silu")
+    seq_idx = torch.cat(
+        [
+            torch.zeros(B, 41, dtype=torch.int32, device=device),
+            torch.ones(B, L - 41, dtype=torch.int32, device=device),
+        ],
+        dim=1,
+    )
+    out = causal_conv1d_mojo.causal_conv1d_fn(
+        x, weight, seq_idx=seq_idx, activation="silu"
+    )
+    ref = _ref_with_seq_idx(x, weight, None, seq_idx, "silu")
     assert _max_diff(out, ref) < _FWD_TOL[dtype]
 
 
