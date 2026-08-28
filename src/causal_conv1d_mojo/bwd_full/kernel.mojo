@@ -3,6 +3,12 @@
 Mirrors upstream's `causal_conv1d_bwd.cu`. The launcher lives in
 `launch.mojo`; this file holds the kernel + the warp / block
 reduction helpers it depends on.
+
+For the dual packed-sequence + initial-state variant, virtual positions
+before t=0 carry `seq_idx[b, 0]`. The same id gate used by forward is
+applied while recomputing silu', accumulating boundary dweight terms,
+and producing dinitial_states, so the state belongs only to the first
+packed sequence in each row.
 """
 
 from std.gpu import block_idx, thread_idx, barrier
@@ -361,8 +367,10 @@ def bwd_full_kernel[
         # = its own kNElts + a `(W-1)` halo on each side. The halos are
         # what Phase 3's silu' (left) and Phase 5/6's dx + dweight
         # (right) need to gate the conv with `seq_idx[s] == seq_idx[t]`.
-        # Out-of-range positions get -1 so the gate naturally fails.
-        # seq_idx is small (Int32, B*L), no smem dance needed.
+        # Out-of-range positions get -1 so the gate naturally fails,
+        # except that the dual seq_idx + initial_states variant assigns
+        # pre-t=0 positions the first packed sequence's id. seq_idx is
+        # small (Int32, B*L), no smem dance needed.
         comptime kSeqIdxWindow: Int = 2 * (width - 1) + kNElts
         var seq_idx_window = InlineArray[Int32, kSeqIdxWindow](
             uninitialized=True
@@ -375,7 +383,14 @@ def bwd_full_kernel[
                 if 0 <= t_j and t_j < seqlen:
                     seq_idx_window[j] = seq_idx[batch_id, t_j]
                 else:
-                    seq_idx_window[j] = -1
+
+                    comptime if has_initial_states:
+                        if t_j < 0:
+                            seq_idx_window[j] = seq_idx[batch_id, 0]
+                        else:
+                            seq_idx_window[j] = -1
+                    else:
+                        seq_idx_window[j] = -1
 
         # ---- [P1] load x_curr and dout_curr ----
         # `alignment=16` promises a 16-byte aligned base, letting the
@@ -730,7 +745,7 @@ def bwd_full_kernel[
                         acc += x_curr[i] * dout_halo[halo_idx_dw - kNElts]
             local_dweight[k] += acc
 
-        # ---- [P7] initial_states-only contributions (chunk 0, tidx 0) ----
+        # ---- [P7] initial_states contributions (chunk 0, tidx 0) ----
         # When the forward read initial_states for `t in [0, W-1)`, two
         # gradient pieces appear:
         #   - dinitial_states[i] = sum_{k<=i} weight[k] * dpre[i - k]
@@ -741,6 +756,9 @@ def bwd_full_kernel[
         #       dweight[k] += sum_{t<W-1-k} dpre[t] * initial_states[t+k].
         # dinitial_states is written here directly; the dweight terms
         # accumulate into local_dweight and join the block reduce below.
+        # With seq_idx, both use the virtual initial-position id from
+        # Phase 0, preventing a short first fragment's successors from
+        # contributing to either gradient.
         comptime if has_initial_states:
             if chunk == 0 and tidx == 0:
 
@@ -750,7 +768,14 @@ def bwd_full_kernel[
                     comptime for k in range(width):
 
                         comptime if i - k >= 0:
-                            dinit_v += weights[k] * dpre[i - k]
+
+                            comptime if has_seq_idx:
+                                if seq_idx_window[i] == seq_idx_window[
+                                    (width - 1) + i - k
+                                ]:
+                                    dinit_v += weights[k] * dpre[i - k]
+                            else:
+                                dinit_v += weights[k] * dpre[i - k]
                     dinitial_states[batch_id, channel_id, i] = dinit_v.cast[
                         dtype
                     ]()
@@ -761,7 +786,14 @@ def bwd_full_kernel[
                         var is_v = initial_states[
                             batch_id, channel_id, t + k
                         ].cast[accum_t]()
-                        local_dweight[k] += dpre[t] * is_v
+
+                        comptime if has_seq_idx:
+                            if seq_idx_window[t + k] == seq_idx_window[
+                                (width - 1) + t
+                            ]:
+                                local_dweight[k] += dpre[t] * is_v
+                        else:
+                            local_dweight[k] += dpre[t] * is_v
 
     # === Phase 4: block-reduce dweight, dbias and atomic-add to global ===
     # `scope="agent"` + `ordering=MONOTONIC` is the same memory model as

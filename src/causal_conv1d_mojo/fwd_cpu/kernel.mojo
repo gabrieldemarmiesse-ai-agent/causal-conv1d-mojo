@@ -7,7 +7,9 @@ without a GPU without forcing users to `pip install causal-conv1d`
 
 Structure per (b, d) row:
   * boundary region `t < W-1`: scalar; history reaches back into
-    `initial_states` (or implicit zeros), with seq_idx gating.
+    `initial_states` (or implicit zeros), with seq_idx gating. When
+    both are present, the virtual initial positions carry
+    `seq_idx[b, 0]`, so only the first packed sequence sees them.
   * main region `t >= W-1`: every tap is in-range, so the tap loop is
     branch-free. When x/out are unit-stride along t and there is no
     seq_idx, the loop is explicitly vectorized: `kV` outputs per step,
@@ -92,11 +94,20 @@ def _fwd_scalar_at[
                 comptime if has_initial_states:
                     # src_t in [-(W-1), 0); index 0..W-2 of initial_states.
                     var is_idx: Int = src_t + (width - 1)
-                    pre = (
-                        init_row[is_idx * is_ls]
-                        .cast[DType.float32]()
-                        .fma(weights[k], pre)
-                    )
+
+                    comptime if has_seq_idx:
+                        if si_row[0] == cur_id:
+                            pre = (
+                                init_row[is_idx * is_ls]
+                                .cast[DType.float32]()
+                                .fma(weights[k], pre)
+                            )
+                    else:
+                        pre = (
+                            init_row[is_idx * is_ls]
+                            .cast[DType.float32]()
+                            .fma(weights[k], pre)
+                        )
         else:
             # Main region: src_t is always in [0, seqlen).
             var include: Bool = True
@@ -159,7 +170,8 @@ def fwd_kernel_cpu[
         has_bias: load `bias_ptr[d]` per channel, or skip and use 0.
         has_seq_idx: gate historical reads on `seq_idx[b, src_t] ==
             seq_idx[b, t]`; force output to 0 when `seq_idx[b, t] < 0`
-            (padding).
+            (padding). If initial_states is also present, its virtual
+            positions use `seq_idx[b, 0]` for this gate.
         apply_silu: apply silu (= swish) on the output, or skip.
     When the gate is False, the corresponding pointer is never
     dereferenced — caller may pass null from the Python wrapper.

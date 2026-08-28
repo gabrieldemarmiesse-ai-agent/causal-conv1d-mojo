@@ -399,15 +399,20 @@ def test_initial_states_chunked_roundtrip_short_chunks(device, dtype, chunk_size
     assert _max_diff(init, x[..., -(W - 1) :]) == 0.0
 
 
-def test_initial_states_mutual_exclusion_with_seq_idx():
-    x = torch.randn(1, 8, 16, dtype=torch.float16)
-    weight = torch.randn(8, 4, dtype=torch.float16)
-    seq_idx = torch.zeros(1, 16, dtype=torch.int32)
-    init = torch.randn(1, 8, 3, dtype=torch.float16)
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        causal_conv1d_mojo.causal_conv1d_fn(
-            x, weight, seq_idx=seq_idx, initial_states=init
-        )
+def test_initial_states_with_seq_idx(device, dtype):
+    """The initial state belongs only to the first packed sequence."""
+    x = torch.randn(1, 8, 16, dtype=dtype, device=device)
+    weight = torch.randn(8, 4, dtype=dtype, device=device)
+    seq_idx = torch.tensor([[3] + [5] * 15], dtype=torch.int32, device=device)
+    init = torch.randn(1, 8, 3, dtype=dtype, device=device)
+
+    out = causal_conv1d_mojo.causal_conv1d_fn(
+        x, weight, seq_idx=seq_idx, initial_states=init
+    )
+    ref = causal_conv1d_mojo.causal_conv1d_ref(
+        x, weight, initial_states=init, seq_idx=seq_idx
+    )
+    assert _max_diff(out, ref) < _FWD_TOL[dtype]
 
 
 def test_initial_states_shape_validation():

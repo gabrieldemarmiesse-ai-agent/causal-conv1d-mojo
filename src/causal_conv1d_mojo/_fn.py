@@ -382,17 +382,22 @@ def causal_conv1d_fn(
     final_states_out: (batch, dim, width - 1), to be written to
     activation: either None or "silu" or "swish"
 
+    When seq_idx and initial_states are both provided, virtual positions
+    before t=0 carry seq_idx[:, 0]. The initial state therefore contributes
+    only to positions belonging to the first packed sequence in each row.
+    Positions with seq_idx < 0 are padding and produce zero output.
+
     out: (batch, dim, seqlen)
     """
     # MPS small-shape fast path — bypass all validation so tiny calls
     # don't pay ~9μs of Python checks on top of an already-cheap conv.
     # The Mojo kernel beats pure-PyTorch only at B*D*L >= ~4M on Apple
     # GPUs, so below that we route straight to causal_conv1d_ref.
-    # `causal_conv1d_ref` and the F.conv1d it calls do their own input
+    # `causal_conv1d_ref` and the PyTorch ops it calls do their own input
     # validation, so malformed inputs still error (with less specific
-    # messages than the wrapper would give). Only safe when seq_idx is
-    # None (ref doesn't support packed sequences) and dim > 0 (F.conv1d
-    # rejects groups=0).
+    # messages than the wrapper would give). Packed-sequence calls stay
+    # on the Mojo path; dim must be positive because F.conv1d rejects
+    # groups=0.
     if x.device.type == "mps" and seq_idx is None:
         B, D, L = x.shape
         if D > 0 and 0 < B * D * L < _MPS_FWD_FALLBACK_THRESHOLD:
@@ -470,16 +475,12 @@ def causal_conv1d_fn(
     # seq_idx + return_final_states are mutually exclusive (matches
     # upstream): with packed sequences in one batch row, "the last W-1
     # cols" doesn't have a single owning sequence.
-    # seq_idx + initial_states are also mutually exclusive: per-position
-    # masking and a shared "before t=0" context aren't compatible.
     if seq_idx is not None:
         if return_final_states:
             raise ValueError(
                 "seq_idx and return_final_states are mutually exclusive "
                 "(packed sequences have no single 'last W-1 cols')"
             )
-        if initial_states is not None:
-            raise ValueError("seq_idx and initial_states are mutually exclusive")
         if seq_idx.shape != (batch, seqlen):
             raise ValueError(
                 f"seq_idx shape {tuple(seq_idx.shape)} != expected {(batch, seqlen)}"

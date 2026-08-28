@@ -677,6 +677,17 @@ on H100 fp16 to ~1.0-1.3× on the same shapes):
    `(1,128,2048,4)` sits at ~1.25× upstream (3.5 vs 2.8 µs) — smaller
    rows, direct weight loads, and pre-barrier halo hoisting were all
    tried and regressed other shapes (see the Mojo gotchas below).
+8. **Packed sequences plus initial states (upstream v1.7.0 parity).**
+   The virtual `W-1` positions before `t=0` carry `seq_idx[b, 0]`, so
+   the initial state is visible only to positions with the first packed
+   sequence's id. This matters when that first fragment is shorter than
+   `W-1`: the following sequence must not read the remaining state taps.
+   Forward assigns that id to the negative-time seq window; backward
+   applies the same gate to silu' recomputation, initial-state dweight
+   terms, and `dinitial_states`. Padding ids (`seq_idx < 0`) still force
+   output and `dpre` to zero. `seq_idx + return_final_states` remains
+   unsupported. seq_idx continues to route channel-last inputs through
+   the generic strided GPU kernel.
 
 ## CPU kernel design (`fwd_cpu/`, `bwd_full_cpu/`, `update_cpu/`)
 
@@ -691,8 +702,9 @@ on fwd/bwd, up to ~140× on update at M4 decode shapes). The patterns:
    vector loads/stores along t.
 2. **Boundary/main split.** Per (b, d) row: t < W-1 runs a scalar
    helper that keeps the `src_t < 0` handling (initial_states /
-   implicit zeros); t >= W-1 is branch-free (every tap in-range). The
-   main region vectorizes (kV = 32 bytes of x per tap load) when
+   implicit zeros), including the `seq_idx[b, 0]` virtual id when both
+   features are present; t >= W-1 is branch-free (every tap in-range).
+   The main region vectorizes (kV = 32 bytes of x per tap load) when
    x/out (and dout/dx for bwd) are unit-stride along t and there is no
    seq_idx; otherwise it falls back to the same scalar helper. W
    overlapping unaligned vector loads per kV outputs all hit L1 —
