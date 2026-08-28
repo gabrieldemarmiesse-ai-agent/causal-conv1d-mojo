@@ -103,6 +103,19 @@ def _assert_repeated_equal(results):
             )
 
 
+# `many_rows` reduces dweight/dbias over B*L = 65_536 terms — 16x the
+# largest reduction in the shared bwd matrix — and the result is then
+# rounded to the parameter dtype. For bf16 one ulp at ||dw_ref||_inf is
+# already ~0.4%, i.e. the same order as `_DW_TOL`'s rtol, so a
+# different-but-equally-valid fp32 accumulation order (another CPU
+# reassociates the sum at its own SIMD width) lands a few ulps out:
+# measured 1 ulp locally, 4 on the x86 CI runner. The deterministic and
+# default paths produce bit-identical error there, so this is output
+# granularity rather than the workspace reduction. Widen bf16 for this
+# shape only; every other case keeps the shared bound.
+_DW_RTOL_LARGE_REDUCTION = {torch.bfloat16: 4e-2}
+
+
 @pytest.mark.parametrize("mode", ["env", "torch"], ids=["env1", "torch_flag"])
 @pytest.mark.parametrize(
     "shape", [(64, 64, 1024), (7, 16, 73)], ids=["many_rows", "odd_seqlen"]
@@ -133,8 +146,9 @@ def test_deterministic_backward_repeatable_and_correct(
     _assert_repeated_equal(results)
     actual = results[0]
     assert _max_diff(actual["dx"], dx_ref) < _DX_TOL[dtype]
-    _assert_dw_close(actual["dw"], dw_ref, dtype, name="deterministic dw")
-    _assert_dw_close(actual["db"], db_ref, dtype, name="deterministic db")
+    dw_rtol = _DW_RTOL_LARGE_REDUCTION.get(dtype) if B * L >= 1 << 16 else None
+    _assert_dw_close(actual["dw"], dw_ref, dtype, name="deterministic dw", rtol=dw_rtol)
+    _assert_dw_close(actual["db"], db_ref, dtype, name="deterministic db", rtol=dw_rtol)
 
 
 def test_deterministic_no_bias_silu_seq_idx(device, monkeypatch):

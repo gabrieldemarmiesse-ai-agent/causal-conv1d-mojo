@@ -32,9 +32,15 @@ _DW_TOL = {
 }
 
 
-def _assert_dw_close(actual, ref, dtype, *, name="dw"):
-    """Relative-to-||ref||_inf max-diff check for reduction grads."""
-    atol, rtol = _DW_TOL[dtype]
+def _assert_dw_close(actual, ref, dtype, *, name="dw", rtol=None):
+    """Relative-to-||ref||_inf max-diff check for reduction grads.
+
+    `rtol` overrides the per-dtype default for reductions far larger
+    than this matrix's, where the result's own storage granularity
+    dominates (see `test_determinism.py`).
+    """
+    atol, default_rtol = _DW_TOL[dtype]
+    rtol = default_rtol if rtol is None else rtol
     norm = ref.detach().float().abs().max().item()
     bound = atol + rtol * norm
     diff = _max_diff(actual, ref)
