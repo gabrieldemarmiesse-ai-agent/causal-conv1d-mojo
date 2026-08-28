@@ -40,6 +40,18 @@ _KN_ELTS_WIDE = {0: 8, 1: 8, 2: 4}
 _KN_ELTS_NARROW = 4
 # Block size (`kNThreads` in bwd_full/common.mojo).
 _KNTHREADS = 128
+_ELEMENT_SIZE = {0: 2, 1: 2, 2: 4}
+
+
+def _rows_are_16b_aligned(
+    ptr: int, batch_stride: int, channel_stride: int, element_size: int
+) -> bool:
+    """Whether every (batch, channel) row starts on a 16-byte boundary."""
+    return (
+        ptr % 16 == 0
+        and (batch_stride * element_size) % 16 == 0
+        and (channel_stride * element_size) % 16 == 0
+    )
 
 
 def call_bwd_full(args: tuple, pre_dispatch: Callable[[], None] | None = None) -> None:
@@ -74,16 +86,34 @@ def _config_from_args(args: tuple) -> tuple:
         and args[17] == 1  # dout_l_stride
         and args[20] == 1  # dx_l_stride
     )
+    element_size = _ELEMENT_SIZE[dtype_code]
+    rows_16b_aligned = (
+        _rows_are_16b_aligned(args[0], args[10], args[11], element_size)
+        and _rows_are_16b_aligned(args[3], args[15], args[16], element_size)
+        and _rows_are_16b_aligned(args[4], args[18], args[19], element_size)
+    )
 
     # Match the original dispatcher's runtime n_elts pick: wide only if
-    # (a) wide differs from narrow (i.e. dtype is 16-bit) and (b) seqlen
-    # is aligned to kNThreads * wide. Else narrow (4).
+    # (a) wide differs from narrow (i.e. dtype is 16-bit), (b) seqlen is
+    # aligned to kNThreads * wide, and (c) every row of every tensor this
+    # variant vector-accesses (x, dout, dx) is 16-byte aligned. Otherwise
+    # use the narrow, alignment-agnostic variant.
+    #
+    # (c) applies only to the contiguous-inner path: that is the one that
+    # issues 16-byte accesses along a row. A strided x (channel-last, or
+    # any non-unit seqlen stride) is read scalar, so its row bases can't
+    # fault and the wide halo stays available — which is what widths 6..9
+    # need, and what this dispatcher did before the alignment proof was
+    # added.
+    vec_rows_ok = rows_16b_aligned or not contig_inner
     n_elts_wide = _KN_ELTS_WIDE[dtype_code]
     use_wide = (
-        n_elts_wide != _KN_ELTS_NARROW and (seqlen % (_KNTHREADS * n_elts_wide)) == 0
+        vec_rows_ok
+        and n_elts_wide != _KN_ELTS_NARROW
+        and (seqlen % (_KNTHREADS * n_elts_wide)) == 0
     )
     n_elts = n_elts_wide if use_wide else _KN_ELTS_NARROW
-    aligned_seq = (seqlen % (_KNTHREADS * n_elts)) == 0
+    aligned_seq = vec_rows_ok and (seqlen % (_KNTHREADS * n_elts)) == 0
     # See fwd/_jit.py for why this is comptime instead of a runtime
     # branch on `stream_handle_addr`. Python wrapper sets 1 for CUDA,
     # 0 for Metal.
@@ -110,7 +140,7 @@ def _mod_name(config: tuple) -> str:
     return (
         f"{_DTYPE_NAME[dt]}_n{ne}_w{w}"
         f"_hb{int(hb)}_hs{int(hs)}_hi{int(hi)}_silu{int(silu)}"
-        f"_contig{int(c)}_aligned{int(a)}_det{int(det)}_extstr{int(ues)}"
+        f"_contig{int(c)}_chunk16{int(a)}_det{int(det)}_extstr{int(ues)}"
     )
 
 

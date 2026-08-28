@@ -22,7 +22,7 @@ from std.bit import log2_floor
 from std.math import ceildiv, exp, recip
 from std.memory import stack_allocation
 from std.atomic import Atomic, Ordering
-from std.sys import llvm_intrinsic
+from std.sys import llvm_intrinsic, size_of
 from std.sys.info import is_nvidia_gpu
 from std.utils.index import StaticTuple
 from layout import TileTensor, TensorLayout, Idx, Coord
@@ -296,6 +296,11 @@ def bwd_full_kernel[
     After the chunk loop: block-reduce dweight/dbias, then either write the
     `(batch, channel)` partial to a private fp32 workspace slot
     (`deterministic=True`) or atomic-add it to the global accumulator.
+
+    `aligned_seq` means both that seqlen is a whole `kChunkSize` and that
+    every x/dout/dx row is 16-byte aligned. Only that specialization may
+    issue 16-byte global accesses; the generic contiguous specialization
+    uses dtype alignment for all global sequence loads/stores.
     """
     comptime assert (
         TileTensor[dtype, XLayoutType, ImmutAnyOrigin].flat_rank == 3
@@ -310,8 +315,9 @@ def bwd_full_kernel[
     ), "bwd_full_kernel: unexpected tensor ranks"
     comptime accum_t = DType.float32
     # Per-thread element count, set by the dispatcher: 8 for fp16/bf16
-    # when seqlen is a multiple of 1024, else 4 (to keep all 128 threads
-    # busy on small seqlens). For fp32 it's always 4 (16-byte LDG cap).
+    # when seqlen is a multiple of 1024 and x/dout/dx rows are all 16-byte
+    # aligned, else 4 (to keep all 128 threads busy on small seqlens and
+    # make the unaligned path compact). For fp32 it's always 4.
     # Forward uses a fixed 4 because its grid scales with seqlen and a
     # wider per-thread tile halves parallelism; here the grid is (D, B)
     # and the chunk loop walks the seqlen, so a wider tile only
@@ -399,18 +405,14 @@ def bwd_full_kernel[
                         seq_idx_window[j] = -1
 
         # ---- [P1] load x_curr and dout_curr ----
-        # `alignment=16` promises a 16-byte aligned base, letting the
-        # compiler emit the widest single-instruction global load: LDG.E.U64
-        # for fp16/bf16 (kNElts=4 × 2 B = 8 B/thread) or LDG.E.128 for fp32
-        # (kNElts=4 × 4 B = 16 B/thread). Without it the default alignment
-        # is align_of[dtype] = 2 or 4, which blocks the merge — even when
-        # widths line up — and the compiler falls back to scalar loads.
-        # Standard PyTorch row-major tensors satisfy the 16-byte promise:
-        # base addresses are large multiples of channel/batch strides
-        # which are 16-aligned, and seq_start lands on a kNElts boundary.
-        # `aligned_seq` is comptime: when True (the typical case where
-        # seqlen % kChunkSize == 0) the per-element bounds-checked
-        # fallback isn't compiled at all, halving the kernel size.
+        # On the aligned variant, `alignment=16` lets the compiler emit
+        # the widest single-instruction global load: LDG.E.U64 for
+        # fp16/bf16 (kNElts=4 × 2 B = 8 B/thread) or LDG.E.128 for fp32
+        # (kNElts=4 × 4 B = 16 B/thread). The dispatcher verifies
+        # x/dout/dx pointers and both outer row strides before setting
+        # `aligned_seq`. When False, even wholly in-range slices promise
+        # only dtype alignment, mirroring upstream's scalar
+        # `BLOCK_LOAD_WARP_TRANSPOSE` path.
         var x_curr = SIMD[accum_t, kNElts](0)
         var dout_curr = SIMD[accum_t, kNElts](0)
 
@@ -423,10 +425,12 @@ def bwd_full_kernel[
             ).cast[accum_t]()
         elif contig_inner:
             if chunk_start + kChunkSize <= seqlen:
-                x_curr = x.load[width=kNElts, alignment=16](
+                x_curr = x.load[width=kNElts, alignment=size_of[dtype]()](
                     Coord(batch_id, channel_id, seq_start)
                 ).cast[accum_t]()
-                dout_curr = dout.load[width=kNElts, alignment=16](
+                dout_curr = dout.load[
+                    width=kNElts, alignment=size_of[dtype]()
+                ](
                     Coord(batch_id, channel_id, seq_start)
                 ).cast[accum_t]()
             else:
@@ -453,16 +457,20 @@ def bwd_full_kernel[
         # tidx>0:  read previous thread's x_curr from smem.
         var x_prev = SIMD[accum_t, kNElts](0)
         if tidx == 0 and chunk > 0:
-            # `chunk > 0` ⇒ chunk_start ≥ kChunkSize > kNElts ⇒ all kNElts
-            # elements at [chunk_start - kNElts, chunk_start) are in
-            # range. `chunk_start` is a multiple of `kChunkSize` (=
-            # `kNThreads * kNElts`), so `chunk_start - kNElts` is a
-            # multiple of kNElts ⇒ kNElts-aligned addr ⇒ 16-byte aligned
-            # for both fp16/bf16 (kNElts=8 × 2 B = 16) and fp32
-            # (kNElts=4 × 4 B = 16). Skip the per-element bounds-checked
-            # scalar path for `contig_inner` and issue a single LDG.E.128.
-            comptime if contig_inner:
+            # `chunk > 0` makes the whole halo in-range. Only the aligned
+            # variant may promise a 16-byte row base; the generic
+            # contiguous variant keeps the same slice load but uses dtype
+            # alignment so odd row strides and pointer offsets are safe.
+            comptime if contig_inner and aligned_seq:
                 x_prev = x.load[width=kNElts, alignment=16](
+                    Coord(
+                        batch_id,
+                        channel_id,
+                        chunk_start - kNElts,
+                    )
+                ).cast[accum_t]()
+            elif contig_inner:
+                x_prev = x.load[width=kNElts, alignment=size_of[dtype]()](
                     Coord(
                         batch_id,
                         channel_id,
@@ -709,7 +717,7 @@ def bwd_full_kernel[
             )
         elif contig_inner:
             if chunk_start + kChunkSize <= seqlen:
-                dx.store[alignment=16](
+                dx.store[alignment=size_of[dtype]()](
                     Coord(batch_id, channel_id, seq_start),
                     dx_vals.cast[dtype](),
                 )

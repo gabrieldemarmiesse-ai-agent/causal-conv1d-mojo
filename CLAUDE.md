@@ -37,7 +37,8 @@ upstream Tri Dao CUDA", with upstream as the moving target.
     derivation of the host CPU brand (mojo's `-march=native` codegen
     bakes host SIMD into the `.so`'s host-side glue, so different CPUs
     must not share cache entries), and `<mod_name>` is a readable
-    config string like `fp16_w4_hb0_hs0_hi0_silu0_contig1_aligned1`.
+    config string like
+    `fp16_w4_hb0_hs0_hi0_silu0_contig1_chunk161_vec161_cl0_extstr1`.
     See "Cache-key contents" below for what `<h>` covers.
   - `fwd_cpu/`, `bwd_full_cpu/`, `update_cpu/`: CPU kernels. Same
     JIT-on-first-use plumbing as the GPU subpackages — each (subpkg,
@@ -620,24 +621,37 @@ on H100 fp16 to ~1.0-1.3× on the same shapes):
    weights/bias N times and re-read boundary elements from global. The
    new design loads weight+bias once and shares boundary x values via
    smem.
-2. **16-byte LDG.** Per thread, load `kNElts = 16 // sizeof(dtype)`
-   elements as a single vec instruction — 8 for fp16/bf16, 4 for fp32.
-   Set this from the dtype via `size_of[dtype]()` so all three dtypes
-   pick the right width. The vec load needs `alignment=16` on the
-   `TileTensor.load[]` call (the comptime inner-stride=1 promise is
-   already in the Layout for `contig_inner` mode).
+2. **16-byte LDG, only after proving every row base.** Per thread, the
+   aligned variants load `kNElts = 16 // sizeof(dtype)` elements as one
+   vec instruction — 8 for fp16/bf16, 4 for fp32. Inner stride 1 is not
+   enough: the dispatcher also requires `data_ptr % 16 == 0` and both
+   `(batch_stride * sizeof(dtype)) % 16 == 0` and
+   `(channel_stride * sizeof(dtype)) % 16 == 0` for every sequence tensor
+   vector-accessed (fwd: x/out; bwd: x/dout/dx). A contiguous `(B,D,L)`
+   tensor with odd L, or a sequence slice starting at an odd element, can
+   violate that promise. Those calls compile the non-vector specialization,
+   whose whole-row slice loads/stores use `alignment=size_of[dtype]()`;
+   this mirrors upstream's scalar `BLOCK_LOAD_WARP_TRANSPOSE` path. Shared-
+   memory vectors remain `alignment=16` because their allocation and slot
+   spacing guarantee it.
 3. **Smem ring-buffer for the (W-1) halo.** Each thread shares its
    *last (W-1) x values* with the next thread via shared memory; the
    slot at `kNThreads-1` doubles as the inter-chunk carry. Three
    barriers per chunk: write halo, read halo, late-write the new carry
    (the third write is gated to thread `kNThreads-1` only so thread 0's
    halo read still sees the *previous chunk's* tail in the same slot).
-4. **`aligned_seq` comptime gate.** When `seqlen % (kNThreads*kNElts) ==
-   0`, drop the bounds-checked tail-chunk path entirely. Halves the
-   compiled kernel size and avoids the predicated stores ptxas can't
-   merge.
+4. **`aligned_seq` / `vec_aligned` comptime gates.** `aligned_seq` now
+   means both `seqlen % (kNThreads*kNElts) == 0` *and* the row-alignment
+   proof above; `vec_aligned` is the weaker `seqlen % kNElts == 0` with
+   the same proof. The former drops the bounds-checked tail-chunk path;
+   the latter retains a partial chunk but knows each thread's slice is
+   wholly in or out of range. Readable cache names surface these as
+   `chunk16{0,1}` and `vec16{0,1}`. Backward's 8-element fp16/bf16
+   `n_elts` choice is likewise allowed only after x/dout/dx pass the
+   16-byte row proof; otherwise it uses the 4-element generic variant.
 5. **One cubin per (dtype × width × has_bias × has_seq_idx ×
-   has_initial_states × apply_silu × contig_inner × aligned_seq) leaf,
+   has_initial_states × apply_silu × contig_inner × aligned_seq ×
+   vec_aligned) leaf,
    compiled JIT on first use.** Each leaf compiles to its own
    single-variant `.so` via `_jit_common.compile_and_load`, cached at
    `~/.cache/causal_conv1d_mojo/<sub>/<backend>/<arch>/<mod_name>.hash-<h>.so`
@@ -688,6 +702,19 @@ on H100 fp16 to ~1.0-1.3× on the same shapes):
      mostly hit L2) vs down to 8 while < 512 on Metal. On the bench
      shape rows=16 beats rows=8 (halo traffic) and rows=32 (occupancy).
    Also 3.9× over the scalar fallback on M4 (1327→337 µs, same shape),
+   within ~8% of the seqlen-contiguous kernel there. seq_idx still
+   takes the generic path (upstream is the opposite: their seq_idx
+   *requires* channel-last). The dispatch gate requires 16B-aligned
+   x/out/bias base pointers and x/out batch + seqlen strides divisible
+   by `kNElts` elements. Because `kNElts = 16 / sizeof(dtype)`, that
+   element-stride condition is exactly a 16-byte stride for fp16, bf16,
+   and fp32; together with `c0` advancing by `kNElts`, it covers every
+   x/out vector row. Weight staging is scalar from global then vectorized
+   only in guaranteed-aligned shared memory; `initial_states` is scalar,
+   so arbitrary valid outer strides remain safe. The gate also requires
+   `width <= 5` — the
+   unrolled walk carries the halo in `kUnroll = 4` registers, so wider
+   fp16/bf16 filters (we support up to 9) stay on the generic kernel.
    within ~8% of the seqlen-contiguous kernel there. Packed seq_idx now
    uses this path: a `(W-1)` row-id halo travels beside the x register
    halo, and the four fresh ids are loaded with the four fresh x rows.
@@ -715,6 +742,18 @@ on H100 fp16 to ~1.0-1.3× on the same shapes):
    applies the same gate to silu' recomputation, initial-state dweight
    terms, and `dinitial_states`. Padding ids (`seq_idx < 0`) still force
    output and `dpre` to zero. `seq_idx + return_final_states` remains
+   unsupported. seq_idx continues to route channel-last inputs through
+   the generic strided GPU kernel.
+9. **State buffers and update vectors.** Generic fwd/bwd access
+   `initial_states` / `dinitial_states` one scalar at a time, so they do
+   not participate in the 16-byte dispatch proof. Update's x, conv_state,
+   and out token-loop accesses are also scalar and honor their element
+   strides, which makes offset columns such as `big[:, :, 5]` safe. Its
+   weight vector is enabled only when width stride is 1 and the base plus
+   channel stride preserve `sizeof(dtype) * width` alignment; otherwise
+   the taps are scalar-loaded with `w_w_stride`. The short linear-state
+   vector load is used only for `state_l_stride == 1`; strided conv-state
+   views take scalar history loads.
    unsupported. Eligible channel-last forward inputs use the dedicated
    kernel above; contiguous, wide-filter, dim-tail, or unaligned cases
    retain the generic strided GPU fallback. Backward remains generic.

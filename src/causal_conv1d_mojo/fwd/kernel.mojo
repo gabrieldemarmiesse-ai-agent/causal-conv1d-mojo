@@ -9,7 +9,9 @@ Design (matches upstream's tri-dao kernel):
   `dim3 grid(params.batch, params.dim)`.
 - Block size: `kNThreads` (=128). Per-thread element count:
   `kNElts = 16 / sizeof(dtype)` (=8 for fp16/bf16, =4 for fp32) so
-  every per-chunk load is a 16-byte vector (`ld.global.nc.v4.b32`).
+  aligned rows use a 16-byte vector (`ld.global.nc.v4.b32`). Rows whose
+  base pointer or outer strides do not preserve 16-byte alignment use
+  element-aligned accesses, matching upstream's non-vector load path.
 - Chunk size: `kNThreads * kNElts` (=1024 for fp16, =512 for fp32).
 - Halo (W-1 values from previous chunk) shared via `smem_exchange`:
   slot `kNThreads-1` carries the previous chunk's tail across chunks.
@@ -34,6 +36,7 @@ from std.gpu.globals import MAX_THREADS_PER_BLOCK_METADATA
 from std.gpu.memory import AddressSpace
 from std.math import ceildiv
 from std.memory import stack_allocation
+from std.sys import size_of
 from std.utils.index import StaticTuple
 from layout import TileTensor, TensorLayout, Idx, Coord
 
@@ -88,21 +91,20 @@ def fwd_kernel[
     the dispatcher in the Layout types (`Idx[1]` in the inner-stride
     slot), so the inner-stride multiply folds out at comptime.
 
-    `aligned_seq`: seqlen is a multiple of `kNThreads * kNElts`. When
-    True, the per-chunk bounds-checked tail path is dropped — halves
-    the kernel's compiled code and eliminates predicated stores.
+    `aligned_seq`: seqlen is a multiple of `kNThreads * kNElts` and every
+    x/output row is 16-byte aligned. When True, the per-chunk
+    bounds-checked tail path is dropped and global loads/stores use the
+    16-byte vector path.
 
-    `vec_aligned`: weaker — seqlen is a multiple of `kNElts` (always
-    True for power-of-two seqlens). Each thread's `seq_start` is also a
-    multiple of `kNElts`, so `seq_start < seqlen` ⟺ `seq_start +
-    kNElts ≤ seqlen`; the partial-element scalar fallback path
-    becomes statically dead and gets dropped at comptime. This is the
-    case for shapes like `(B, D, 512, W)` where chunk-alignment fails
-    (kChunkSize=1024 for fp16) but vec-alignment still holds — without
-    this gate the compiler emits `kNElts` predicated scalar loads and
-    `kNElts` predicated scalar stores per fully-OOB thread, fattening
-    the kernel and adding ~4× branches versus upstream's vec-load path.
-    Mirrors upstream's `kIsVecLoad` BOOL_SWITCH.
+    `vec_aligned`: weaker — seqlen is a multiple of `kNElts` and every
+    x/output row is 16-byte aligned. Each thread's `seq_start` is also a
+    multiple of `kNElts`, so its slice is wholly in or out of bounds;
+    the partial-element scalar fallback path becomes statically dead.
+    This is the case for aligned shapes like `(B, D, 512, W)` where
+    chunk-alignment fails (kChunkSize=1024 for fp16) but vector alignment
+    still holds. The length condition mirrors upstream's `kIsVecLoad`
+    switch; the row-alignment checks additionally make sliced and odd-row-
+    stride tensors safe.
     """
     comptime assert (
         TileTensor[dtype, XLayoutType, ImmutAnyOrigin].flat_rank == 3
@@ -181,12 +183,12 @@ def fwd_kernel[
                     Coord(batch_id, channel_id, seq_start)
                 )
         elif contig_inner:
-            # Per-thread vec load when the thread's kNElts slice is fully
-            # in-bounds — even on a partial chunk. Threads at the
-            # boundary fall back to scalar; threads past `seqlen` skip
-            # the load entirely (their `x_curr` stays at 0).
+            # Upstream's non-kIsVecLoad path uses scalar global accesses
+            # for the whole row. Preserve the per-thread slice here but
+            # promise only dtype alignment, so a misaligned row can never
+            # lower to a faulting 16-byte transaction.
             if seq_start + kNElts <= seqlen:
-                x_curr = x.load[width=kNElts, alignment=16](
+                x_curr = x.load[width=kNElts, alignment=size_of[dtype]()](
                     Coord(batch_id, channel_id, seq_start)
                 )
             elif seq_start < seqlen:
@@ -337,11 +339,9 @@ def fwd_kernel[
                 out_vals.cast[dtype](),
             )
         elif contig_inner:
-            # Same per-thread vec store as the load: when this thread's
-            # kNElts slice is fully in-bounds, emit one st.global.v4.b32;
-            # else fall through to scalar predicated stores.
+            # Same alignment-agnostic policy as the load above.
             if seq_start + kNElts <= seqlen:
-                output.store[alignment=16](
+                output.store[alignment=size_of[dtype]()](
                     Coord(batch_id, channel_id, seq_start),
                     out_vals.cast[dtype](),
                 )

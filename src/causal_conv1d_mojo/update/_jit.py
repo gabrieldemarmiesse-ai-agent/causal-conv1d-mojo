@@ -1,9 +1,9 @@
 """JIT-on-first-use dispatcher for causal_conv1d update.
 
 Each unique runtime config (dtype × width × has_bias × apply_silu ×
-has_state_indices × is_circular × use_external_stream) compiles the
-static ``update/variant.mojo`` once via ``mojo build -D KEY=VALUE …``
-and caches the resulting ``.so`` on disk.
+has_state_indices × is_circular × weight_vec_aligned × state_contig ×
+use_external_stream) compiles the static ``update/variant.mojo`` once
+via ``mojo build -D KEY=VALUE …`` and caches the resulting ``.so`` on disk.
 
 Performance note (AMD-specific): The Mojo `DeviceContext()` constructor
 calls `hipStreamCreate` under the hood, and the matching `__del__`
@@ -29,6 +29,7 @@ _VARIANT_MOJO = _UPDATE_DIR / "variant.mojo"
 
 _DTYPE_NAME = {0: "fp16", 1: "bf16", 2: "fp32"}
 _DTYPE_DEFINE = {0: "float16", 1: "bfloat16", 2: "float32"}
+_ELEMENT_SIZE = {0: 2, 1: 2, 2: 4}
 
 
 def call_update(args: tuple, pre_dispatch: Callable[[], None] | None = None) -> None:
@@ -49,29 +50,42 @@ def call_update(args: tuple, pre_dispatch: Callable[[], None] | None = None) -> 
 
 
 def _config_from_args(args: tuple) -> tuple:
+    dtype_code = args[22]
+    width = args[24]
+    element_size = _ELEMENT_SIZE[dtype_code]
+    weight_vec_bytes = element_size * width
+    weight_vec_aligned = (
+        width in (2, 4)
+        and args[13] == 1  # w_w_stride
+        and args[1] % weight_vec_bytes == 0
+        and (args[12] * element_size) % weight_vec_bytes == 0
+    )
     return (
-        args[22],  # dtype_code
-        args[24],  # width
+        dtype_code,
+        width,
         bool(args[20]),  # has_bias
         bool(args[21]),  # apply_silu
         bool(args[25]),  # has_state_indices
         bool(args[27]),  # is_circular
+        weight_vec_aligned,
+        args[16] == 1,  # state_l_stride
         # See fwd/_jit.py for why this is comptime, not runtime branch.
         bool(args[29]),  # use_external_stream (1 for CUDA, 0 for Metal)
     )
 
 
 def _mod_name(config: tuple) -> str:
-    (dt, w, hb, silu, hi, circ, ues) = config
+    (dt, w, hb, silu, hi, circ, wv, sc, ues) = config
     return (
         f"{_DTYPE_NAME[dt]}_w{w}"
         f"_hb{int(hb)}_silu{int(silu)}_hi{int(hi)}_circ{int(circ)}"
+        f"_wvec{int(wv)}_scontig{int(sc)}"
         f"_extstr{int(ues)}"
     )
 
 
 def _defines(config: tuple) -> dict[str, str]:
-    (dt, w, hb, silu, hi, circ, ues) = config
+    (dt, w, hb, silu, hi, circ, wv, sc, ues) = config
 
     def b(x: bool) -> str:
         return "true" if x else "false"
@@ -83,6 +97,8 @@ def _defines(config: tuple) -> dict[str, str]:
         "APPLY_SILU": b(silu),
         "HAS_STATE_INDICES": b(hi),
         "IS_CIRCULAR": b(circ),
+        "WEIGHT_VEC_ALIGNED": b(wv),
+        "STATE_CONTIG": b(sc),
         "USE_EXTERNAL_STREAM": b(ues),
     }
 

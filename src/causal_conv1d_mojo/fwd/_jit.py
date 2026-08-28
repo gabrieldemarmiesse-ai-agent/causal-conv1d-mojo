@@ -36,6 +36,18 @@ _DTYPE_DEFINE = {0: "float16", 1: "bfloat16", 2: "float32"}
 _KN_ELTS = {0: 8, 1: 8, 2: 4}
 # Block size (`kNThreads` in fwd/common.mojo).
 _KNTHREADS = 128
+_ELEMENT_SIZE = {0: 2, 1: 2, 2: 4}
+
+
+def _rows_are_16b_aligned(
+    ptr: int, batch_stride: int, channel_stride: int, element_size: int
+) -> bool:
+    """Whether every (batch, channel) row starts on a 16-byte boundary."""
+    return (
+        ptr % 16 == 0
+        and (batch_stride * element_size) % 16 == 0
+        and (channel_stride * element_size) % 16 == 0
+    )
 
 
 def call_fwd(args: tuple, pre_dispatch: Callable[[], None] | None = None) -> None:
@@ -67,14 +79,21 @@ def _config_from_args(args: tuple) -> tuple:
     has_initial_states = bool(args[24])
     seqlen = args[6]
     contig_inner = args[9] == 1 and args[11] == 1 and args[14] == 1
-    aligned_seq = (seqlen % (_KNTHREADS * _KN_ELTS[dtype_code])) == 0
-    # `vec_aligned` is the weaker "seqlen % kNElts == 0" — true for any
-    # power-of-two seqlen on fp16/bf16 (kNElts=8) and fp32 (kNElts=4).
-    # When this holds, every thread's kNElts slice either fits entirely
-    # inside [0, seqlen) or starts past it, so the partial-chunk scalar
-    # fallback path in the kernel becomes statically dead. Mirrors
-    # upstream's `kIsVecLoad` BOOL_SWITCH (gated on the same condition).
-    vec_aligned = (seqlen % _KN_ELTS[dtype_code]) == 0
+    element_size = _ELEMENT_SIZE[dtype_code]
+    rows_16b_aligned = _rows_are_16b_aligned(
+        args[0], args[7], args[8], element_size
+    ) and _rows_are_16b_aligned(args[3], args[12], args[13], element_size)
+    aligned_seq = (
+        rows_16b_aligned and (seqlen % (_KNTHREADS * _KN_ELTS[dtype_code])) == 0
+    )
+    # `vec_aligned` is the weaker vector-access gate. As upstream's
+    # `kIsVecLoad` switch does, it requires `seqlen % kNElts == 0`, so
+    # every thread's slice is wholly in or out of bounds. Unlike upstream,
+    # also verify every x/out row base: a contiguous (B,D,L) tensor has
+    # channel stride L, and an otherwise-valid view may start at an odd
+    # element offset. Either case can make a 16-byte access fault even
+    # though the inner stride is one.
+    vec_aligned = rows_16b_aligned and (seqlen % _KN_ELTS[dtype_code]) == 0
     # `use_external_stream` is a comptime gate: True for CUDA/HIP (wrap
     # torch's CUstream/hipStream and enqueue on it), False for Metal
     # (no CUDA-style streams; enqueue on the DeviceContext directly +
@@ -148,7 +167,7 @@ def _mod_name(config: tuple) -> str:
     return (
         f"{_DTYPE_NAME[dt]}_w{w}"
         f"_hb{int(hb)}_hs{int(hs)}_hi{int(hi)}_silu{int(silu)}"
-        f"_contig{int(c)}_aligned{int(a)}_vec{int(va)}_cl{int(cl)}"
+        f"_contig{int(c)}_chunk16{int(a)}_vec16{int(va)}_cl{int(cl)}"
         f"_extstr{int(ues)}"
     )
 

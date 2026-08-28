@@ -18,7 +18,7 @@ def native_update(
     out: torch.Tensor,
     apply_silu: bool,
 ) -> None:
-    # 29-tuple expected by the JIT-generated variant entry point.
+    # 30-tuple expected by the JIT-generated variant entry point.
     # Each unique runtime config lazily compiles its own single-variant
     # `.so` on first use, then caches it under
     # `$XDG_CACHE_HOME/causal_conv1d_mojo/update/`.

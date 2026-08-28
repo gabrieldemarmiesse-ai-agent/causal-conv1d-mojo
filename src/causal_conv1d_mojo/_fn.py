@@ -25,6 +25,7 @@ import os
 import torch
 
 from causal_conv1d_mojo._dtype import _DTYPE_CODE
+from causal_conv1d_mojo._mps import gpu_address
 from causal_conv1d_mojo.bwd_full import native_bwd_full, native_bwd_full_mps
 from causal_conv1d_mojo.bwd_full_cpu import native_bwd_full_cpu
 from causal_conv1d_mojo.fwd import native_fwd, native_fwd_mps
@@ -51,6 +52,17 @@ def _use_deterministic_mode() -> bool:
     if env == "0":
         return False
     return torch.are_deterministic_algorithms_enabled()
+
+
+def _sequence_rows_are_16b_aligned(x: torch.Tensor) -> bool:
+    """Whether every (batch, channel) row has a 16-byte-aligned base."""
+    element_size = x.element_size()
+    base_ptr = gpu_address(x) if x.device.type == "mps" else x.data_ptr()
+    return (
+        base_ptr % 16 == 0
+        and (x.stride(0) * element_size) % 16 == 0
+        and (x.stride(1) * element_size) % 16 == 0
+    )
 
 
 def _write_final_states(
@@ -248,7 +260,8 @@ class _CausalConv1dFn(torch.autograd.Function):
     """fp16/bf16/fp32 autograd op (CUDA + CPU).
 
     Widths: 2..9 for fp16/bf16, 2..5 for fp32; backward additionally
-    requires seqlen aligned to 1024 when width > 5.
+    requires seqlen aligned to 1024 when width > 5, plus 16-byte-aligned
+    x rows when x is seqlen-contiguous.
 
     Dispatches to the GPU launcher when `x.is_cuda`, otherwise to the
     pure-mojo CPU launcher (parallelized over (B, D) via
@@ -323,7 +336,15 @@ class _CausalConv1dFn(torch.autograd.Function):
         if dout.stride(-1) != 1:
             dout = dout.contiguous()
 
-        dx = torch.empty_like(x)
+        # Widths 6..9 need the bwd kernel's 8-element halo. Its wide
+        # variant is legal only when x/dout/dx row bases are 16-byte
+        # aligned, so make the two backward-owned tensors contiguous;
+        # the public validator has already checked saved x.
+        if W > 5:
+            dout = dout.contiguous()
+            dx = torch.empty_like(x, memory_format=torch.contiguous_format)
+        else:
+            dx = torch.empty_like(x)
         # Default variants atomic-add block/row partials into shared fp32
         # accumulators. Deterministic variants plain-store into private
         # batch-major fp32 rows, which are zero-filled so early-return
@@ -484,12 +505,12 @@ def causal_conv1d_fn(
     # holding `kNElts` slots — the (W-1) halo must fit into one slot.
     # kNElts is 8 for fp16/bf16 and 4 for fp32 (16 bytes / dtype). The
     # bwd kernel additionally drops to kNElts=4 on the unaligned tail
-    # path (seqlen % 1024 != 0), so width >5 on the unaligned path
-    # would corrupt the dx halo accumulation. Conservative limit:
+    # path (seqlen % 1024 != 0 or a row is not 16-byte aligned), so
+    # width >5 on that path would not fit the dx halo. Conservative limit:
     # widths 2..9 for fp16/bf16, 2..5 for fp32, and require seqlen
-    # aligned to 1024 elements when width > 5. Wider widths on fp32 or
-    # the bwd's unaligned path need a redesigned halo dance — open an
-    # issue if you need them.
+    # aligned to 1024 elements with aligned x rows when width > 5. Wider
+    # widths on fp32 or the bwd's unaligned path need a redesigned halo
+    # dance — open an issue if you need them.
     width = weight.shape[1]
     max_width = 5 if x.dtype == torch.float32 else 9
     if width < 2 or width > max_width:
@@ -501,13 +522,19 @@ def causal_conv1d_fn(
             f"if you need wider."
         )
     if width > 5 and x.requires_grad:
-        if x.shape[-1] % 1024 != 0:
+        # Mirrors bwd/_jit.py's `use_wide`: the row-alignment proof is
+        # only required on the contiguous-inner path, the one that issues
+        # 16-byte accesses along a row. A strided x (e.g. channel-last)
+        # is read scalar and keeps the wide halo.
+        rows_ok = x.stride(-1) != 1 or _sequence_rows_are_16b_aligned(x)
+        if x.shape[-1] % 1024 != 0 or not rows_ok:
             raise NotImplementedError(
                 f"width > 5 with autograd requires seqlen aligned to 1024 "
-                f"(got seqlen={x.shape[-1]}, width={width}). The bwd halo "
-                f"falls back to a 4-slot ring on unaligned seqlens; widths "
-                f"6..9 read past its boundary. Open an issue if you need "
-                f"this combination."
+                f"and, for seqlen-contiguous x, every row 16-byte aligned "
+                f"(got seqlen={x.shape[-1]}, width={width}, "
+                f"x.data_ptr()%16={x.data_ptr() % 16}). The bwd halo falls "
+                f"back to a 4-slot ring otherwise. Open an issue if you "
+                f"need this combination."
             )
     if x.device != weight.device or (bias is not None and x.device != bias.device):
         raise NotImplementedError(

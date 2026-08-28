@@ -22,6 +22,8 @@ comptime HAS_BIAS = get_defined_bool["HAS_BIAS"]()
 comptime APPLY_SILU = get_defined_bool["APPLY_SILU"]()
 comptime HAS_STATE_INDICES = get_defined_bool["HAS_STATE_INDICES"]()
 comptime IS_CIRCULAR = get_defined_bool["IS_CIRCULAR"]()
+comptime WEIGHT_VEC_ALIGNED = get_defined_bool["WEIGHT_VEC_ALIGNED"]()
+comptime STATE_CONTIG = get_defined_bool["STATE_CONTIG"]()
 comptime USE_EXTERNAL_STREAM = get_defined_bool["USE_EXTERNAL_STREAM"]()
 # When non-empty, the path `compile_function` dumps this variant's PTX to
 # (set via the `DUMP_ASSEMBLY_INTO` env var, threaded through `_jit_common`
@@ -83,6 +85,8 @@ def causal_conv1d_update_variant(
         APPLY_SILU,
         HAS_STATE_INDICES,
         IS_CIRCULAR,
+        WEIGHT_VEC_ALIGNED,
+        STATE_CONTIG,
         USE_EXTERNAL_STREAM,
         DUMP_ASSEMBLY_INTO,
     ](

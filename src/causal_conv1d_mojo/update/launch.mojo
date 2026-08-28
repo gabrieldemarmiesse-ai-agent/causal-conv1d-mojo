@@ -40,6 +40,8 @@ def launch_update[
     apply_silu: Bool,
     has_state_indices: Bool,
     is_circular: Bool,
+    weight_vec_aligned: Bool,
+    state_contig: Bool,
     use_external_stream: Bool,
     dump_assembly_into: StaticString = "",
 ](
@@ -113,6 +115,8 @@ def launch_update[
             apply_silu,
             has_state_indices,
             is_circular,
+            weight_vec_aligned,
+            state_contig,
         ],
         dump_asm=dump_assembly_into,
     ]()
@@ -134,6 +138,7 @@ def launch_update[
             x_c_stride,
             x_l_stride,
             w_c_stride,
+            w_w_stride,
             state_b_stride,
             state_c_stride,
             state_l_stride,
@@ -160,6 +165,7 @@ def launch_update[
             x_c_stride,
             x_l_stride,
             w_c_stride,
+            w_w_stride,
             state_b_stride,
             state_c_stride,
             state_l_stride,
