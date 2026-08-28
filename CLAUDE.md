@@ -57,6 +57,12 @@ upstream Tri Dao CUDA", with upstream as the moving target.
     logic (see below).
   - `_fn.py`, `_update.py`, `reference.py`: Python facades + pure-PyTorch
     reference implementations.
+  - `causal_conv1d_varlen.py`: packed-batch trailing-state extraction.
+    The primary function is a fully vectorized PyTorch gather (including
+    moving CPU `cu_seqlens` to x's device), with no per-sequence host sync;
+    `_ref` deliberately keeps the obvious Python loop for cross-checking.
+    Both return `(batch, dim, state_len)` with dim contiguous
+    (`stride(1) == 1`), ready for `causal_conv1d_update`'s `conv_state`.
 - `tests/`: pytest suite. Run with `uv run --extra nvidia pytest` (the
   `nvidia` extra brings in upstream causal-conv1d for the reference op).
 - `scripts/`: all benchmark drivers, perf gates, and dev tooling live

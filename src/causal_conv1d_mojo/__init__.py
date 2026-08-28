@@ -9,6 +9,10 @@ own single-variant `.so` via `mojo build` at call time and caches
 the result under
 `$XDG_CACHE_HOME/causal_conv1d_mojo/<subpkg>/<backend>[/<arch>]/`.
 See `<subpkg>/_jit.py` and `_jit_common.py`.
+
+Packed-batch state extraction is Python-only: the primary
+`causal_conv1d_varlen_states` uses a sync-free vectorized PyTorch gather,
+while `causal_conv1d_varlen_states_ref` is the simple loop reference.
 """
 
 from __future__ import annotations
