@@ -95,6 +95,9 @@ def native_bwd_full_mps(
     """
     from causal_conv1d_mojo.bwd_full._jit import call_bwd_full
 
+    # Same 40-tuple ABI as CUDA. `_jit.py` derives channel-last dispatch
+    # from these addresses/strides, so the optimized path adds no ABI slot.
+
     def _pre_dispatch() -> None:
         # Post-compile, pre-launch: revive every argument tensor's
         # MTLHeap (see _mps.revive_heaps), then flush torch's queue.

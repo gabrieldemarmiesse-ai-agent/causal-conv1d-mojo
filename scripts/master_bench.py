@@ -123,8 +123,8 @@ REPO = Path(__file__).resolve().parent.parent
 # the shapes that exercise the kernel are the same everywhere.
 # A `+cl` suffix on a shape means channel-last x/out (bench_kernel strips
 # it and passes --channel-last to _bench.py) — that layout dispatches the
-# dedicated fwd_channellast_kernel, which competes against upstream's own
-# channellast CUDA kernel and needs its own gate coverage.
+# dedicated fwd/bwd channel-last kernels, which compete against upstream's
+# own channel-last CUDA kernels and need their own gate coverage.
 SHAPES = {
     "fwd": {
         "canon": "1,4096,2048,4",
@@ -148,11 +148,10 @@ SHAPES = {
         "full": ["1,512", "1,2048", "4,2048", "16,2048", "32,4096"],
     },
 }
-# bwd has no channel-last kernel (the generic strided path handles that
-# layout) — gate only the contiguous shapes there.
 SHAPES["bwd"] = {
     "canon": SHAPES["fwd"]["canon"],
-    "full": [s for s in SHAPES["fwd"]["full"] if not s.endswith("+cl")],
+    "quick": ["1,4096,2048,4", "1,4096,2048,4+cl"],
+    "full": list(SHAPES["fwd"]["full"]),
 }
 
 SUBPKG = {"fwd": "fwd", "bwd": "bwd_full", "update": "update"}

@@ -17,12 +17,19 @@ Caller responsibilities:
 
 from std.gpu.host import DeviceContext
 from std.gpu.host.device_context import _DeviceContextPtr, _DeviceContextCpp
+from std.math import ceildiv
 from std.memory import OpaquePointer
 from layout import TileTensor, Idx, TensorLayout
 from layout.tile_layout import Layout
 
 from kernel import bwd_full_kernel
-from common import kNThreads
+from kernel_channellast import bwd_channellast_kernel
+from common import (
+    kChunkCBwdCL_for,
+    kChunkLBwdCLLong,
+    kChunkLBwdCLShort,
+    kNThreads,
+)
 
 
 def launch_bwd_full[
@@ -36,6 +43,7 @@ def launch_bwd_full[
     contig_inner: Bool,
     aligned_seq: Bool,
     deterministic: Bool,
+    channel_last: Bool,
     use_external_stream: Bool,
     dump_assembly_into: StaticString = "",
 ](
@@ -128,6 +136,126 @@ def launch_bwd_full[
     var dinitial_states_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
         unsafe_from_address=dinitial_states_addr
     )
+
+    # Channel-last fast path: transpose `(L, C)` tiles through shared
+    # memory so global x/dout/dx traffic stays in 16-byte vectors along
+    # contiguous C while each compute thread owns one channel over an L
+    # run. Raw pointers avoid TileTensor's dynamic-layout prologue. The
+    # Python dispatcher proves the alignment/stride preconditions and pins
+    # generic-only config flags, so all shapes of one semantic config share
+    # this cached variant.
+    comptime if channel_last:
+        comptime kChunkC = kChunkCBwdCL_for[dtype]()
+
+        @parameter
+        def launch_channel_last[kChunkL: Int]() raises:
+            var compiled_cl = ctx.compile_function[
+                bwd_channellast_kernel[
+                    dtype,
+                    kChunkL,
+                    width,
+                    has_bias,
+                    has_seq_idx,
+                    has_initial_states,
+                    apply_silu,
+                ],
+                dump_asm=dump_assembly_into,
+            ]()
+            # (L-chunks, batch, C-chunks): L is the only axis that can
+            # exceed CUDA's 65535 y/z limit, matching channel-last fwd.
+            var grid_cl = (
+                ceildiv(seqlen_int, kChunkL),
+                batch_int,
+                ceildiv(dim_int, kChunkC),
+            )
+            comptime if use_external_stream:
+                var stream_cl = ctx.create_external_stream(stream_opaque)
+                stream_cl.enqueue_function(
+                    compiled_cl,
+                    seqlen_int,
+                    dim_int,
+                    x_ptr,
+                    w_ptr,
+                    b_ptr,
+                    dout_ptr,
+                    seq_idx_ptr,
+                    initial_states_ptr,
+                    dx_ptr,
+                    dweight_acc_ptr,
+                    dbias_acc_ptr,
+                    dinitial_states_ptr,
+                    x_b_stride,
+                    x_l_stride,
+                    w_c_stride,
+                    w_w_stride,
+                    dout_b_stride,
+                    dout_l_stride,
+                    dx_b_stride,
+                    dx_l_stride,
+                    seq_idx_b_stride,
+                    seq_idx_l_stride,
+                    initial_states_b_stride,
+                    initial_states_c_stride,
+                    initial_states_l_stride,
+                    dinitial_states_b_stride,
+                    dinitial_states_c_stride,
+                    dinitial_states_l_stride,
+                    grid_dim=grid_cl,
+                    block_dim=(kNThreads,),
+                )
+            else:
+                ctx.enqueue_function(
+                    compiled_cl,
+                    seqlen_int,
+                    dim_int,
+                    x_ptr,
+                    w_ptr,
+                    b_ptr,
+                    dout_ptr,
+                    seq_idx_ptr,
+                    initial_states_ptr,
+                    dx_ptr,
+                    dweight_acc_ptr,
+                    dbias_acc_ptr,
+                    dinitial_states_ptr,
+                    x_b_stride,
+                    x_l_stride,
+                    w_c_stride,
+                    w_w_stride,
+                    dout_b_stride,
+                    dout_l_stride,
+                    dx_b_stride,
+                    dx_l_stride,
+                    seq_idx_b_stride,
+                    seq_idx_l_stride,
+                    initial_states_b_stride,
+                    initial_states_c_stride,
+                    initial_states_l_stride,
+                    dinitial_states_b_stride,
+                    dinitial_states_c_stride,
+                    dinitial_states_l_stride,
+                    grid_dim=grid_cl,
+                    block_dim=(kNThreads,),
+                )
+                ctx.synchronize()
+
+        # 128 rows minimizes halo reloads and reduction atomics once the
+        # grid is wide. Underfill uses a 64-row specialization to expose
+        # more blocks and halve per-thread register arrays. The threshold
+        # mirrors fwd: discrete CUDA/HIP wants more resident work than
+        # Apple's unified-memory GPU.
+        comptime kMinBlocksCL = 1024 if use_external_stream else 512
+        var n_chunks_c = ceildiv(dim_int, kChunkC)
+        var long_blocks = (
+            batch_int
+            * n_chunks_c
+            * ceildiv(seqlen_int, kChunkLBwdCLLong)
+        )
+        if seqlen_int <= kChunkLBwdCLLong or long_blocks < kMinBlocksCL:
+            launch_channel_last[kChunkLBwdCLShort]()
+        else:
+            launch_channel_last[kChunkLBwdCLLong]()
+        return
 
     # seq_idx (B, L), initial_states (B, D, W-1), dinitial_states
     # (B, D, W-1) become TileTensors so the kernel can do scalar
