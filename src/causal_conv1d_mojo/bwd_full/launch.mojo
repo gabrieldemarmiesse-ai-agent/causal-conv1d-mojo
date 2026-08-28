@@ -7,9 +7,11 @@ launch logic here keeps each JIT variant template small.
 Caller responsibilities:
 - Bail out on any zero-sized dim (`batch == 0 || dim == 0 || seqlen == 0`)
   *before* calling.
-- Zero `dweight_acc` (and `dbias_acc` if `has_bias=True`) before the call
-  — the kernel atomic-adds into them. (Autograd's `backward()` already
-  does this for the grad tensors it allocates.)
+- For `deterministic=False`, zero `dweight_acc` (and `dbias_acc` if
+  `has_bias=True`) before the call — the kernel atomic-adds into them.
+  For `deterministic=True`, pass dense batch-major fp32 workspaces shaped
+  `(batch, dim, width)` and `(batch, dim)`; each block plain-stores its
+  private partial.
 - Pass the comptime params that select the right kernel specialisation.
 """
 
@@ -33,6 +35,7 @@ def launch_bwd_full[
     apply_silu: Bool,
     contig_inner: Bool,
     aligned_seq: Bool,
+    deterministic: Bool,
     use_external_stream: Bool,
     dump_assembly_into: StaticString = "",
 ](
@@ -192,6 +195,7 @@ def launch_bwd_full[
                 apply_silu,
                 contig_inner,
                 aligned_seq,
+                deterministic,
                 XLT,
                 WLT,
                 DoutLT,

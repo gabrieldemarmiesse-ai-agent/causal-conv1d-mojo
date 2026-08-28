@@ -2,7 +2,7 @@
 
 Each unique runtime config (dtype × n_elts × width × has_bias ×
 has_seq_idx × has_initial_states × apply_silu × contig_inner ×
-aligned_seq × use_external_stream) compiles the static
+aligned_seq × deterministic × use_external_stream) compiles the static
 ``bwd_full/variant.mojo`` once via ``mojo build -D KEY=VALUE …`` and
 caches the resulting ``.so`` on disk.
 
@@ -53,9 +53,10 @@ def call_bwd_full(args: tuple, pre_dispatch: Callable[[], None] | None = None) -
     variant_fn, ctx_handle = _get_variant_fn(_config_from_args(args))
     if pre_dispatch is not None:
         pre_dispatch()
-    # Tack ctx_handle on as the 41st positional arg — the variant
-    # entry point destructures `args[40]` for it. (args[39] is the
-    # `use_external_stream` flag, already a comptime define.)
+    # Tack ctx_handle on as the 42nd positional arg — the variant
+    # entry point destructures `args[41]` for it. (args[39:41] are the
+    # `use_external_stream` and `deterministic` flags, already comptime
+    # defines.)
     variant_fn(*args, ctx_handle)
 
 
@@ -87,6 +88,7 @@ def _config_from_args(args: tuple) -> tuple:
     # branch on `stream_handle_addr`. Python wrapper sets 1 for CUDA,
     # 0 for Metal.
     use_external_stream = bool(args[39])
+    deterministic = bool(args[40])
 
     return (
         dtype_code,
@@ -98,21 +100,22 @@ def _config_from_args(args: tuple) -> tuple:
         apply_silu,
         contig_inner,
         aligned_seq,
+        deterministic,
         use_external_stream,
     )
 
 
 def _mod_name(config: tuple) -> str:
-    (dt, ne, w, hb, hs, hi, silu, c, a, ues) = config
+    (dt, ne, w, hb, hs, hi, silu, c, a, det, ues) = config
     return (
         f"{_DTYPE_NAME[dt]}_n{ne}_w{w}"
         f"_hb{int(hb)}_hs{int(hs)}_hi{int(hi)}_silu{int(silu)}"
-        f"_contig{int(c)}_aligned{int(a)}_extstr{int(ues)}"
+        f"_contig{int(c)}_aligned{int(a)}_det{int(det)}_extstr{int(ues)}"
     )
 
 
 def _defines(config: tuple) -> dict[str, str]:
-    (dt, ne, w, hb, hs, hi, silu, c, a, ues) = config
+    (dt, ne, w, hb, hs, hi, silu, c, a, det, ues) = config
 
     def b(x: bool) -> str:
         return "true" if x else "false"
@@ -127,6 +130,7 @@ def _defines(config: tuple) -> dict[str, str]:
         "APPLY_SILU": b(silu),
         "CONTIG_INNER": b(c),
         "ALIGNED_SEQ": b(a),
+        "DETERMINISTIC": b(det),
         "USE_EXTERNAL_STREAM": b(ues),
     }
 

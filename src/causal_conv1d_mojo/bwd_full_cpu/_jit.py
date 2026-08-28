@@ -23,12 +23,15 @@ def call_bwd_full_cpu(config: tuple, runtime_args: tuple) -> None:
 
 
 def _mod_name(config: tuple) -> str:
-    (dt, w, hb, hs, hi, silu) = config
-    return f"{_DTYPE_NAME[dt]}_w{w}_hb{int(hb)}_hs{int(hs)}_hi{int(hi)}_silu{int(silu)}"
+    (dt, w, hb, hs, hi, silu, det) = config
+    return (
+        f"{_DTYPE_NAME[dt]}_w{w}_hb{int(hb)}_hs{int(hs)}_hi{int(hi)}"
+        f"_silu{int(silu)}_det{int(det)}"
+    )
 
 
 def _defines(config: tuple) -> dict[str, str]:
-    (dt, w, hb, hs, hi, silu) = config
+    (dt, w, hb, hs, hi, silu, det) = config
 
     def b(x: bool) -> str:
         return "true" if x else "false"
@@ -40,6 +43,7 @@ def _defines(config: tuple) -> dict[str, str]:
         "HAS_SEQ_IDX": b(hs),
         "HAS_INITIAL_STATES": b(hi),
         "APPLY_SILU": b(silu),
+        "DETERMINISTIC": b(det),
     }
 
 

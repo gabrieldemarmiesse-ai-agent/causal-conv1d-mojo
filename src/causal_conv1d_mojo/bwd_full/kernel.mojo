@@ -2,7 +2,10 @@
 
 Mirrors upstream's `causal_conv1d_bwd.cu`. The launcher lives in
 `launch.mojo`; this file holds the kernel + the warp / block
-reduction helpers it depends on.
+reduction helpers it depends on. Deterministic variants store each
+`(batch, channel)` dweight/dbias partial into a private fp32 workspace
+slot for Python to reduce in a fixed order; default variants retain the
+upstream-style relaxed float atomics.
 
 For the dual packed-sequence + initial-state variant, virtual positions
 before t=0 carry `seq_idx[b, 0]`. The same id gate used by forward is
@@ -11,7 +14,7 @@ and producing dinitial_states, so the state belongs only to the first
 packed sequence in each row.
 """
 
-from std.gpu import block_idx, thread_idx, barrier
+from std.gpu import block_idx, thread_idx, barrier, grid_dim
 from std.gpu.globals import MAX_THREADS_PER_BLOCK_METADATA, WARP_SIZE
 from std.gpu.memory import AddressSpace
 from std.gpu.primitives.warp import shuffle_xor
@@ -238,6 +241,7 @@ def bwd_full_kernel[
     apply_silu: Bool,
     contig_inner: Bool,
     aligned_seq: Bool,
+    deterministic: Bool,
     XLayoutType: TensorLayout,
     WLayoutType: TensorLayout,
     DoutLayoutType: TensorLayout,
@@ -289,7 +293,9 @@ def bwd_full_kernel[
       [P6] dweight[w] += sum_i x_curr[i] * dpre_with_halo[i + W-1-w];
            dbias    += sum_i dpre[i].
 
-    After the chunk loop: block-reduce dweight,dbias and atomic_add to global.
+    After the chunk loop: block-reduce dweight/dbias, then either write the
+    `(batch, channel)` partial to a private fp32 workspace slot
+    (`deterministic=True`) or atomic-add it to the global accumulator.
     """
     comptime assert (
         TileTensor[dtype, XLayoutType, ImmutAnyOrigin].flat_rank == 3
@@ -795,7 +801,13 @@ def bwd_full_kernel[
                         else:
                             local_dweight[k] += dpre[t] * is_v
 
-    # === Phase 4: block-reduce dweight, dbias and atomic-add to global ===
+    # === Phase 4: block-reduce dweight and dbias ===
+    # Deterministic variants mirror upstream's `kDeterministic` branch:
+    # each block owns one dense `(batch, channel)` workspace row and uses
+    # plain stores. Python then reduces the batch-major workspace with
+    # `.sum(0)`, fixing the across-batch accumulation order. Default
+    # variants retain the exact relaxed atomic-add path below.
+    #
     # `scope="agent"` + `ordering=MONOTONIC` is the same memory model as
     # CUDA's `atomicAdd(...)` — relaxed, GPU-scope. The default
     # `Atomic.fetch_add(...)` lowers to `ATOMG.E.ADD.F32.STRONG.SYS`, a
@@ -826,27 +838,40 @@ def bwd_full_kernel[
             packed
         )
         if tidx == 0:
+            comptime if deterministic:
+                var workspace_row = batch_id * grid_dim.y + channel_id
 
-            comptime for k in range(width):
+                comptime for k in range(width):
+                    dweight_acc_ptr[workspace_row * width + k] = block_red[k]
+                dbias_acc_ptr[workspace_row] = block_red[width]
+            else:
+
+                comptime for k in range(width):
+                    _ = Atomic[DType.float32, scope=kAtomicScope].fetch_add[
+                        ordering=Ordering.RELAXED
+                    ](
+                        dweight_acc_ptr + channel_id * width + k,
+                        block_red[k],
+                    )
                 _ = Atomic[DType.float32, scope=kAtomicScope].fetch_add[
                     ordering=Ordering.RELAXED
-                ](
-                    dweight_acc_ptr + channel_id * width + k,
-                    block_red[k],
-                )
-            _ = Atomic[DType.float32, scope=kAtomicScope].fetch_add[
-                ordering=Ordering.RELAXED
-            ](dbias_acc_ptr + channel_id, block_red[width])
+                ](dbias_acc_ptr + channel_id, block_red[width])
     else:
         var block_red = _block_sum_f32_vec[
             block_size=kNThreads, n=width
         ](local_dweight)
         if tidx == 0:
+            comptime if deterministic:
+                var workspace_row = batch_id * grid_dim.y + channel_id
 
-            comptime for k in range(width):
-                _ = Atomic[DType.float32, scope=kAtomicScope].fetch_add[
-                    ordering=Ordering.RELAXED
-                ](
-                    dweight_acc_ptr + channel_id * width + k,
-                    block_red[k],
-                )
+                comptime for k in range(width):
+                    dweight_acc_ptr[workspace_row * width + k] = block_red[k]
+            else:
+
+                comptime for k in range(width):
+                    _ = Atomic[DType.float32, scope=kAtomicScope].fetch_add[
+                        ordering=Ordering.RELAXED
+                    ](
+                        dweight_acc_ptr + channel_id * width + k,
+                        block_red[k],
+                    )

@@ -26,6 +26,7 @@ comptime HAS_INITIAL_STATES = get_defined_bool["HAS_INITIAL_STATES"]()
 comptime APPLY_SILU = get_defined_bool["APPLY_SILU"]()
 comptime CONTIG_INNER = get_defined_bool["CONTIG_INNER"]()
 comptime ALIGNED_SEQ = get_defined_bool["ALIGNED_SEQ"]()
+comptime DETERMINISTIC = get_defined_bool["DETERMINISTIC"]()
 comptime USE_EXTERNAL_STREAM = get_defined_bool["USE_EXTERNAL_STREAM"]()
 # When non-empty, the path `compile_function` dumps this variant's PTX to
 # (set via the `DUMP_ASSEMBLY_INTO` env var, threaded through `_jit_common`
@@ -84,9 +85,10 @@ def causal_conv1d_bwd_full_variant(
     var dinitial_states_b_stride = UInt32(py=args[36])
     var dinitial_states_c_stride = UInt32(py=args[37])
     var dinitial_states_l_stride = UInt32(py=args[38])
-    # args[39] is `use_external_stream` (already a comptime define);
-    # ctx_handle is appended as args[40] by `call_bwd_full`.
-    var ctx_handle_addr = Int(py=args[40])
+    # args[39] is `use_external_stream` and args[40] is `deterministic`
+    # (both already comptime defines); ctx_handle is appended as args[41]
+    # by `call_bwd_full`.
+    var ctx_handle_addr = Int(py=args[41])
 
     if batch_int == 0 or dim_int == 0 or seqlen_int == 0:
         return PythonObject(None)
@@ -101,6 +103,7 @@ def causal_conv1d_bwd_full_variant(
         APPLY_SILU,
         CONTIG_INNER,
         ALIGNED_SEQ,
+        DETERMINISTIC,
         USE_EXTERNAL_STREAM,
         DUMP_ASSEMBLY_INTO,
     ](

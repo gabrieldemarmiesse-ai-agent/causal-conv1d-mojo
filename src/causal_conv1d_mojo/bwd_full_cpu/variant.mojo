@@ -23,6 +23,7 @@ comptime HAS_BIAS = get_defined_bool["HAS_BIAS"]()
 comptime HAS_SEQ_IDX = get_defined_bool["HAS_SEQ_IDX"]()
 comptime HAS_INITIAL_STATES = get_defined_bool["HAS_INITIAL_STATES"]()
 comptime APPLY_SILU = get_defined_bool["APPLY_SILU"]()
+comptime DETERMINISTIC = get_defined_bool["DETERMINISTIC"]()
 
 
 def causal_conv1d_bwd_full_cpu_variant(
@@ -103,6 +104,7 @@ def causal_conv1d_bwd_full_cpu_variant(
         HAS_SEQ_IDX,
         HAS_INITIAL_STATES,
         APPLY_SILU,
+        DETERMINISTIC,
     ](
         batch_int,
         dim_int,

@@ -313,6 +313,25 @@ a ~1.2 s JIT compile in the request hot path. The error includes the
 full env signature for the missing variant so you can see exactly
 which signal diverged (CPU model, mojo version, modular path, etc.).
 
+### Deterministic backward: `CAUSAL_CONV1D_DETERMINISTIC`
+
+Backward selects its reduction mode on every call, matching upstream.
+`CAUSAL_CONV1D_DETERMINISTIC=1` forces deterministic reduction and
+`CAUSAL_CONV1D_DETERMINISTIC=0` forces the default atomic reduction;
+an unset or other value follows
+`torch.are_deterministic_algorithms_enabled()`. The explicit env value
+therefore overrides PyTorch's process-wide setting in either direction.
+
+The `DETERMINISTIC` comptime flag is part of both GPU and CPU bwd JIT
+keys (`..._det0` / `..._det1`). Default variants keep the shared fp32
+`(D, W)` / `(D,)` accumulators and relaxed float atomics. Deterministic
+variants instead plain-store every row/block's partial into its unique
+batch-major fp32 `(B, D, W)` / `(B, D)` workspace slot; Python reduces
+those workspaces with `.sum(0)` in a fixed order before casting the
+gradients back to the parameter dtype. The workspaces are zero-filled
+so zero-batch/seqlen early returns also reduce to exact zeros. Peak
+temporary memory is `4 * B * D * (W + has_bias)` bytes.
+
 ### Cache-key contents
 
 `<h>` in the cached `.so` filename is sha256(…)[:16] over:
@@ -630,11 +649,16 @@ on H100 fp16 to ~1.0-1.3× on the same shapes):
    per (config, machine) pays ~1-3 s for `mojo build`; every later call
    in this or any future process hits the on-disk cache. There is no
    comptime sweep — each variant is its own translation unit.
-6. **`Atomic[dtype, scope="device"].fetch_add[ordering=RELAXED]`** in
-   the bwd's reduce step. Default atomics on Mojo lower to
+6. **Bwd reduction mode is comptime-specialised.** The default
+   `DETERMINISTIC=false` leaf uses
+   `Atomic[dtype, scope="device"].fetch_add[ordering=RELAXED]` (or
+   agent-scope on AMD). Default Mojo atomics lower to
    `ATOMG.E.ADD.F32.STRONG.SYS` (system-scope, sequentially consistent
-   — drains L2, sync with CPU), which added ~750ns/block on bwd. GPU-
-   scope relaxed atomics are what CUDA's `atomicAdd` does.
+   — drains L2, sync with CPU), which added ~750ns/block on bwd; GPU-
+   scope relaxed atomics are what CUDA's `atomicAdd` does. The
+   `DETERMINISTIC=true` leaf has no across-batch atomics: block `(b,d)`
+   plain-stores its reduced fp32 values into `(B,D,W)` / `(B,D)`
+   workspaces for Python's fixed-order `.sum(0)`.
 7. **Channel-last fwd kernel (`fwd_channellast_kernel`), all backends.**
    When x/out have dim contiguous (`x.stride(1)==1`, the layout a
    `(B, L, D)`-contiguous activation gets after `.transpose(1, 2)` —
@@ -716,8 +740,9 @@ on fwd/bwd, up to ~140× on update at M4 decode shapes). The patterns:
    dweight/dbias partial sums in the same step (the x taps are already
    in registers — dweight is nearly free). Pass B computes dx from the
    buffered dpre window. The buffer extends W-1 past the chunk so pass
-   B never crosses a seam. dweight/dbias flush per row via relaxed
-   atomics (fp32 accumulators), as before.
+   B never crosses a seam. By default dweight/dbias flush per row via
+   relaxed atomics into fp32 accumulators; deterministic variants use
+   plain stores into row-private `(B,D,W)` / `(B,D)` workspaces instead.
 4. **Task-chunked parallelism.** All three kernels deal `batch*dim`
    rows to at most `8 * num_logical_cores()` contiguous row-chunks via
    `sync_parallelize` — one task per *row* drowned small rows in
