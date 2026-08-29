@@ -3,6 +3,8 @@
 No upstream analogue — this exists so the package's autoregressive-
 decode path works on a machine without a GPU. The real product is the
 GPU kernel under `update/`.
+Input/state/output use `dtype`; weight/bias use `wdtype`, with parameter
+loads converted to fp32 before the FMA chain.
 
 Algorithm matches the GPU kernel: depending on `is_circular`, either
 shift `conv_state` left by `seqlen` and write at the tail, or treat
@@ -31,6 +33,7 @@ comptime TASKS_PER_CORE = 8
 
 def update_kernel_cpu[
     dtype: DType,
+    wdtype: DType,
     width: Int,
     has_bias: Bool,
     apply_silu: Bool,
@@ -45,10 +48,10 @@ def update_kernel_cpu[
     x_bs: Int,
     x_cs: Int,
     x_ls: Int,
-    w_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    w_ptr: UnsafePointer[Scalar[wdtype], MutAnyOrigin],
     w_cs: Int,
     w_ws: Int,
-    bias_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    bias_ptr: UnsafePointer[Scalar[wdtype], MutAnyOrigin],
     state_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     state_bs: Int,
     state_cs: Int,

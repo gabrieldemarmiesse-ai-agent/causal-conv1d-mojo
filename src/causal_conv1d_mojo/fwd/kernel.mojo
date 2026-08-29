@@ -4,6 +4,8 @@ Mirrors upstream's `causal_conv1d_fwd.cu`. The launcher lives in
 `launch.mojo`; this file holds only the kernel itself.
 
 Design (matches upstream's tri-dao kernel):
+- Input/state/output use `dtype`; weight/bias independently use
+  `wdtype`. Parameter loads cast to fp32 before accumulation.
 - Grid: `(dim, batch)` — one block per (B, D). Each block walks the
   full seqlen via an inner chunk loop. Mirrors upstream's
   `dim3 grid(params.batch, params.dim)`.
@@ -49,6 +51,7 @@ from _silu import _silu_f32
 )
 def fwd_kernel[
     dtype: DType,
+    wdtype: DType,
     kWidth: Int,
     has_bias: Bool,
     has_seq_idx: Bool,
@@ -65,8 +68,8 @@ def fwd_kernel[
 ](
     seqlen: Int,
     x: TileTensor[dtype, XLayoutType, ImmutAnyOrigin],
-    weight: TileTensor[dtype, WLayoutType, ImmutAnyOrigin],
-    bias_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    weight: TileTensor[wdtype, WLayoutType, ImmutAnyOrigin],
+    bias_ptr: UnsafePointer[Scalar[wdtype], MutAnyOrigin],
     seq_idx: TileTensor[DType.int32, SLayoutType, ImmutAnyOrigin],
     initial_states: TileTensor[dtype, ILayoutType, ImmutAnyOrigin],
     output: TileTensor[mut=True, dtype, OLayoutType, MutAnyOrigin],
@@ -108,7 +111,7 @@ def fwd_kernel[
     """
     comptime assert (
         TileTensor[dtype, XLayoutType, ImmutAnyOrigin].flat_rank == 3
-        and TileTensor[dtype, WLayoutType, ImmutAnyOrigin].flat_rank == 2
+        and TileTensor[wdtype, WLayoutType, ImmutAnyOrigin].flat_rank == 2
         and TileTensor[mut=True, dtype, OLayoutType, MutAnyOrigin].flat_rank
         == 3
         and TileTensor[DType.int32, SLayoutType, ImmutAnyOrigin].flat_rank == 2
@@ -366,6 +369,7 @@ def fwd_kernel[
 )
 def fwd_channellast_kernel[
     dtype: DType,
+    wdtype: DType,
     kWidth: Int,
     has_bias: Bool,
     has_seq_idx: Bool,
@@ -376,8 +380,8 @@ def fwd_channellast_kernel[
     dim: Int,
     rows_per_block: Int,
     x_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    w_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    bias_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    w_ptr: UnsafePointer[Scalar[wdtype], MutAnyOrigin],
+    bias_ptr: UnsafePointer[Scalar[wdtype], MutAnyOrigin],
     seq_idx_ptr: UnsafePointer[Int32, MutAnyOrigin],
     initial_states_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     o_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
@@ -412,9 +416,10 @@ def fwd_channellast_kernel[
     `seq_idx[b, 0]` only when initial states are present.
 
     Dispatch preconditions (gated in `_jit.py`): dim, x/out batch and
-    seqlen strides are all multiples of kNElts (so every vector access
-    is 16-byte aligned), and weight is width-contiguous. seq_idx is made
-    contiguous by `_fn.py`; its explicit strides are still honoured.
+    seqlen strides are all multiples of kNElts (so every input/output
+    vector access is 16-byte aligned), weight is width-contiguous, and
+    the bias base is aligned to `kNElts * sizeof(wdtype)`. seq_idx is
+    made contiguous by `_fn.py`; its explicit strides are still honoured.
 
     `rows_per_block` is runtime, chosen by the launcher: 64 rows when
     the grid is already wide enough, halving to a backend-specific floor
@@ -431,6 +436,11 @@ def fwd_channellast_kernel[
     """
     comptime accum_t = DType.float32
     comptime kNElts: Int = kNEltsFwd[dtype]()
+    # This thread still owns kNElts(dtype) channels, but the staged
+    # weight/bias vector spans their wdtype representation: 8, 16, or
+    # 32 bytes across the supported mixed-dtype pairs. Same-dtype stays
+    # exactly the existing 16-byte vector.
+    comptime kWeightVecBytes: Int = kNElts * size_of[wdtype]()
     # Channels covered by one block (one smem weight-tile row per tap).
     comptime kChunkC: Int = kNThreadsCL * kNElts
 
@@ -457,12 +467,12 @@ def fwd_channellast_kernel[
     # tile with *adjacent* threads touching *adjacent* elements, and
     # each thread then reads its taps back from smem. Layout is
     # transposed (tap-major, `[j][c_local]`) so the read-back below is a
-    # conflict-free 16-byte smem vector per tap.
+    # conflict-free kWeightVecBytes smem vector per tap.
     var w_smem = stack_allocation[
         kWidth * kChunkC,
-        Scalar[dtype],
+        Scalar[wdtype],
         address_space = AddressSpace.SHARED,
-        alignment=16,
+        alignment=kWeightVecBytes,
     ]()
 
     comptime for it in range(kNElts * kWidth):
@@ -471,7 +481,7 @@ def fwd_channellast_kernel[
         var j: Int = e // kChunkC
         var c: Int = chunk_c * kChunkC + c_local
         w_smem[j * kChunkC + c_local] = (
-            w_ptr[c * Int(w_c_stride) + j] if c < dim else Scalar[dtype](0)
+            w_ptr[c * Int(w_c_stride) + j] if c < dim else Scalar[wdtype](0)
         )
     barrier()
 
@@ -483,7 +493,7 @@ def fwd_channellast_kernel[
     var x_base = x_ptr + batch_id * Int(x_b_stride) + c0
     var o_base = o_ptr + batch_id * Int(o_b_stride) + c0
 
-    # ---- This thread's weights: 16-byte smem vector per tap ----
+    # ---- This thread's weights: one kWeightVecBytes smem vector per tap ----
     var w_vecs = InlineArray[SIMD[accum_t, kNElts], kWidth](
         fill=SIMD[accum_t, kNElts](0)
     )
@@ -491,18 +501,20 @@ def fwd_channellast_kernel[
     comptime for j in range(kWidth):
         w_vecs[j] = (
             (w_smem + j * kChunkC + tidx * kNElts)
-            .load[width=kNElts, alignment=16]()
+            .load[width=kNElts, alignment=kWeightVecBytes]()
             .cast[accum_t]()
         )
 
-    # ---- Bias: one 16-byte vector (unit stride; c0*sizeof is 16B-
-    # aligned because c0 is a multiple of kNElts, and c0 < dim with
-    # dim % kNElts == 0 keeps the vector in bounds) ----
+    # ---- Bias: one kWeightVecBytes vector (unit stride; c0 is a
+    # multiple of kNElts, and c0 < dim with dim % kNElts == 0 keeps
+    # the vector in bounds) ----
     var bias_vec = SIMD[accum_t, kNElts](0)
 
     comptime if has_bias:
         bias_vec = (
-            (bias_ptr + c0).load[width=kNElts, alignment=16]().cast[accum_t]()
+            (bias_ptr + c0)
+            .load[width=kNElts, alignment=kWeightVecBytes]()
+            .cast[accum_t]()
         )
 
     var l0: Int = chunk_l * rows_per_block

@@ -4,6 +4,8 @@ No upstream analogue — this exists so the package works on a machine
 without a GPU without forcing users to `pip install causal-conv1d`
 (which needs a C++ toolchain to source-build). The GPU kernels under
 `fwd/` are the real product; this is the fallback — but a fast one.
+Input/state/output use `dtype`; weight/bias use `wdtype`, with both
+converted to fp32 for the existing accumulation chain.
 
 Structure per (b, d) row:
   * boundary region `t < W-1`: scalar; history reaches back into
@@ -135,6 +137,7 @@ def _fwd_scalar_at[
 
 def fwd_kernel_cpu[
     dtype: DType,
+    wdtype: DType,
     width: Int,
     has_bias: Bool,
     has_seq_idx: Bool,
@@ -148,10 +151,10 @@ def fwd_kernel_cpu[
     x_bs: Int,
     x_cs: Int,
     x_ls: Int,
-    w_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    w_ptr: UnsafePointer[Scalar[wdtype], MutAnyOrigin],
     w_cs: Int,
     w_ws: Int,
-    bias_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    bias_ptr: UnsafePointer[Scalar[wdtype], MutAnyOrigin],
     seq_idx_ptr: UnsafePointer[Int32, MutAnyOrigin],
     si_bs: Int,
     si_ls: Int,

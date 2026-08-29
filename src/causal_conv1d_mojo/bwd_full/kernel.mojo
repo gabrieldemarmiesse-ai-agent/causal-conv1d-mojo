@@ -2,10 +2,12 @@
 
 Mirrors upstream's `causal_conv1d_bwd.cu`. The launcher lives in
 `launch.mojo`; this file holds the kernel + the warp / block
-reduction helpers it depends on. Deterministic variants store each
-`(batch, channel)` dweight/dbias partial into a private fp32 workspace
-slot for Python to reduce in a fixed order; default variants retain the
-upstream-style relaxed float atomics.
+reduction helpers it depends on. Activations, state, dout, and dx use
+`dtype`; weight/bias independently use `wdtype` and cast to fp32 on load.
+Deterministic variants store each `(batch, channel)` dweight/dbias
+partial into a private fp32 workspace slot for Python to reduce in a
+fixed order; default variants retain the upstream-style relaxed float
+atomics.
 
 For the dual packed-sequence + initial-state variant, virtual positions
 before t=0 carry `seq_idx[b, 0]`. The same id gate used by forward is
@@ -233,6 +235,7 @@ def _block_sum_f32_vec[
 )
 def bwd_full_kernel[
     dtype: DType,
+    wdtype: DType,
     n_elts: Int,
     width: Int,
     has_bias: Bool,
@@ -252,8 +255,8 @@ def bwd_full_kernel[
 ](
     seqlen: Int,
     x: TileTensor[dtype, XLayoutType, ImmutAnyOrigin],
-    weight: TileTensor[dtype, WLayoutType, ImmutAnyOrigin],
-    bias_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    weight: TileTensor[wdtype, WLayoutType, ImmutAnyOrigin],
+    bias_ptr: UnsafePointer[Scalar[wdtype], MutAnyOrigin],
     dout: TileTensor[dtype, DoutLayoutType, ImmutAnyOrigin],
     seq_idx: TileTensor[DType.int32, SLayoutType, ImmutAnyOrigin],
     initial_states: TileTensor[dtype, ILayoutType, ImmutAnyOrigin],
@@ -304,7 +307,7 @@ def bwd_full_kernel[
     """
     comptime assert (
         TileTensor[dtype, XLayoutType, ImmutAnyOrigin].flat_rank == 3
-        and TileTensor[dtype, WLayoutType, ImmutAnyOrigin].flat_rank == 2
+        and TileTensor[wdtype, WLayoutType, ImmutAnyOrigin].flat_rank == 2
         and TileTensor[dtype, DoutLayoutType, ImmutAnyOrigin].flat_rank == 3
         and TileTensor[mut=True, dtype, DxLayoutType, MutAnyOrigin].flat_rank
         == 3

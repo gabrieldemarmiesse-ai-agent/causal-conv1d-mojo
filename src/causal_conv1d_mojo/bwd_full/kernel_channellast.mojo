@@ -104,6 +104,7 @@ def _reduce_channellast_grads[
 )
 def bwd_channellast_kernel[
     dtype: DType,
+    wdtype: DType,
     kChunkL: Int,
     width: Int,
     has_bias: Bool,
@@ -114,8 +115,8 @@ def bwd_channellast_kernel[
     seqlen: Int,
     dim: Int,
     x_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    weight_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
-    bias_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    weight_ptr: UnsafePointer[Scalar[wdtype], MutAnyOrigin],
+    bias_ptr: UnsafePointer[Scalar[wdtype], MutAnyOrigin],
     dout_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     seq_idx_ptr: UnsafePointer[Int32, MutAnyOrigin],
     initial_states_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],

@@ -1,6 +1,6 @@
 """JIT-on-first-use dispatcher for causal_conv1d bwd_full.
 
-Each unique runtime config (dtype × n_elts × width × has_bias ×
+Each unique runtime config (dtype × wdtype × n_elts × width × has_bias ×
 has_seq_idx × has_initial_states × apply_silu × contig_inner ×
 aligned_seq × deterministic × channel_last × use_external_stream) compiles the static
 ``bwd_full/variant.mojo`` once via ``mojo build -D KEY=VALUE …`` and
@@ -65,8 +65,8 @@ def call_bwd_full(args: tuple, pre_dispatch: Callable[[], None] | None = None) -
     variant_fn, ctx_handle = _get_variant_fn(_config_from_args(args))
     if pre_dispatch is not None:
         pre_dispatch()
-    # Tack ctx_handle on as the 42nd positional arg — the variant
-    # entry point destructures `args[41]` for it. (args[39:41] are the
+    # Tack ctx_handle on as the 43rd positional arg — the variant
+    # entry point destructures `args[42]` for it. (args[40:42] are the
     # `use_external_stream` and `deterministic` flags, already comptime
     # defines.)
     variant_fn(*args, ctx_handle)
@@ -74,11 +74,12 @@ def call_bwd_full(args: tuple, pre_dispatch: Callable[[], None] | None = None) -
 
 def _config_from_args(args: tuple) -> tuple:
     dtype_code = args[23]
-    width = args[25]
+    wdtype_code = args[24]
+    width = args[26]
     has_bias = bool(args[21])
     apply_silu = bool(args[22])
-    has_seq_idx = bool(args[26])
-    has_initial_states = bool(args[30])
+    has_seq_idx = bool(args[27])
+    has_initial_states = bool(args[31])
     seqlen = args[9]
     contig_inner = (
         args[12] == 1  # x_l_stride
@@ -94,7 +95,7 @@ def _config_from_args(args: tuple) -> tuple:
     )
 
     n_elts_wide = _KN_ELTS_WIDE[dtype_code]
-    deterministic = bool(args[40])
+    deterministic = bool(args[41])
     # A `(B,L,D)`-contiguous allocation transposed to `(B,D,L)` has
     # channel stride one and seqlen stride >1. The dedicated kernel
     # vectorizes x/dout/dx along channels, so every base and row/batch
@@ -158,10 +159,11 @@ def _config_from_args(args: tuple) -> tuple:
     # See fwd/_jit.py for why this is comptime instead of a runtime
     # branch on `stream_handle_addr`. Python wrapper sets 1 for CUDA,
     # 0 for Metal.
-    use_external_stream = bool(args[39])
+    use_external_stream = bool(args[40])
 
     return (
         dtype_code,
+        wdtype_code,
         n_elts,
         width,
         has_bias,
@@ -177,9 +179,9 @@ def _config_from_args(args: tuple) -> tuple:
 
 
 def _mod_name(config: tuple) -> str:
-    (dt, ne, w, hb, hs, hi, silu, c, a, det, cl, ues) = config
+    (dt, wdt, ne, w, hb, hs, hi, silu, c, a, det, cl, ues) = config
     return (
-        f"{_DTYPE_NAME[dt]}_n{ne}_w{w}"
+        f"{_DTYPE_NAME[dt]}_w{_DTYPE_NAME[wdt]}_n{ne}_w{w}"
         f"_hb{int(hb)}_hs{int(hs)}_hi{int(hi)}_silu{int(silu)}"
         f"_contig{int(c)}_chunk16{int(a)}_det{int(det)}_cl{int(cl)}"
         f"_extstr{int(ues)}"
@@ -187,13 +189,14 @@ def _mod_name(config: tuple) -> str:
 
 
 def _defines(config: tuple) -> dict[str, str]:
-    (dt, ne, w, hb, hs, hi, silu, c, a, det, cl, ues) = config
+    (dt, wdt, ne, w, hb, hs, hi, silu, c, a, det, cl, ues) = config
 
     def b(x: bool) -> str:
         return "true" if x else "false"
 
     return {
         "DTYPE": _DTYPE_DEFINE[dt],
+        "WDTYPE": _DTYPE_DEFINE[wdt],
         "N_ELTS": str(ne),
         "WIDTH": str(w),
         "HAS_BIAS": b(hb),

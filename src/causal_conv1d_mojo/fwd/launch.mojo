@@ -35,6 +35,7 @@ from common import kNThreads, kNThreadsCL, kChunkLCL, kNEltsFwd
 
 def launch_fwd[
     dtype: DType,
+    wdtype: DType,
     width: Int,
     has_bias: Bool,
     has_seq_idx: Bool,
@@ -98,10 +99,10 @@ def launch_fwd[
     var x_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
         unsafe_from_address=x_addr
     )
-    var w_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
+    var w_ptr = UnsafePointer[Scalar[wdtype], MutAnyOrigin](
         unsafe_from_address=w_addr
     )
-    var b_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
+    var b_ptr = UnsafePointer[Scalar[wdtype], MutAnyOrigin](
         unsafe_from_address=b_addr
     )
     var seq_idx_ptr = UnsafePointer[Int32, MutAnyOrigin](
@@ -123,6 +124,7 @@ def launch_fwd[
         var compiled_cl = ctx.compile_function[
             fwd_channellast_kernel[
                 dtype,
+                wdtype,
                 width,
                 has_bias,
                 has_seq_idx,
@@ -259,7 +261,7 @@ def launch_fwd[
         ILT: TensorLayout,
     ](
         x_tt: TileTensor[dtype, XLT, ImmutAnyOrigin],
-        w_tt: TileTensor[dtype, WLT, ImmutAnyOrigin],
+        w_tt: TileTensor[wdtype, WLT, ImmutAnyOrigin],
         o_tt: TileTensor[mut=True, dtype, OLT, MutAnyOrigin],
         s_tt: TileTensor[DType.int32, SLT, ImmutAnyOrigin],
         i_tt: TileTensor[dtype, ILT, ImmutAnyOrigin],
@@ -267,6 +269,7 @@ def launch_fwd[
         var compiled = ctx.compile_function[
             fwd_kernel[
                 dtype,
+                wdtype,
                 width,
                 has_bias,
                 has_seq_idx,

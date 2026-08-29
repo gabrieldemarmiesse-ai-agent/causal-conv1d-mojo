@@ -54,6 +54,7 @@ def native_bwd_full(
             int(bias is not None),
             int(apply_silu),
             _DTYPE_CODE[x.dtype],
+            _DTYPE_CODE[weight.dtype],
             torch.cuda.current_stream().cuda_stream,
             weight.shape[1],
             int(seq_idx is not None),
@@ -141,6 +142,7 @@ def native_bwd_full_mps(
             int(bias is not None),
             int(apply_silu),
             _DTYPE_CODE[x.dtype],
+            _DTYPE_CODE[weight.dtype],
             0,  # stream_handle_addr — Metal has no streams
             weight.shape[1],
             int(seq_idx is not None),

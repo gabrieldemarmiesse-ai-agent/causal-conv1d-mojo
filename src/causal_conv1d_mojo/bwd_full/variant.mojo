@@ -18,6 +18,7 @@ from launch import launch_bwd_full
 from _ctx import acquire_ctx_handle
 
 comptime DTYPE = get_defined_dtype["DTYPE", DType.float32]()
+comptime WDTYPE = get_defined_dtype["WDTYPE", DType.float32]()
 comptime N_ELTS = get_defined_int["N_ELTS"]()
 comptime WIDTH = get_defined_int["WIDTH"]()
 comptime HAS_BIAS = get_defined_bool["HAS_BIAS"]()
@@ -74,28 +75,29 @@ def causal_conv1d_bwd_full_variant(
     var dx_b_stride = UInt32(py=args[18])
     var dx_c_stride = UInt32(py=args[19])
     var dx_l_stride = UInt32(py=args[20])
-    var stream_handle_addr = Int(py=args[24])
-    var seq_idx_addr = Int(py=args[27])
-    var seq_idx_b_stride = UInt32(py=args[28])
-    var seq_idx_l_stride = UInt32(py=args[29])
-    var initial_states_addr = Int(py=args[31])
-    var initial_states_b_stride = UInt32(py=args[32])
-    var initial_states_c_stride = UInt32(py=args[33])
-    var initial_states_l_stride = UInt32(py=args[34])
-    var dinitial_states_addr = Int(py=args[35])
-    var dinitial_states_b_stride = UInt32(py=args[36])
-    var dinitial_states_c_stride = UInt32(py=args[37])
-    var dinitial_states_l_stride = UInt32(py=args[38])
-    # args[39] is `use_external_stream` and args[40] is `deterministic`
-    # (both already comptime defines); ctx_handle is appended as args[41]
+    var stream_handle_addr = Int(py=args[25])
+    var seq_idx_addr = Int(py=args[28])
+    var seq_idx_b_stride = UInt32(py=args[29])
+    var seq_idx_l_stride = UInt32(py=args[30])
+    var initial_states_addr = Int(py=args[32])
+    var initial_states_b_stride = UInt32(py=args[33])
+    var initial_states_c_stride = UInt32(py=args[34])
+    var initial_states_l_stride = UInt32(py=args[35])
+    var dinitial_states_addr = Int(py=args[36])
+    var dinitial_states_b_stride = UInt32(py=args[37])
+    var dinitial_states_c_stride = UInt32(py=args[38])
+    var dinitial_states_l_stride = UInt32(py=args[39])
+    # args[40] is `use_external_stream` and args[41] is `deterministic`
+    # (both already comptime defines); ctx_handle is appended as args[42]
     # by `call_bwd_full`.
-    var ctx_handle_addr = Int(py=args[41])
+    var ctx_handle_addr = Int(py=args[42])
 
     if batch_int == 0 or dim_int == 0 or seqlen_int == 0:
         return PythonObject(None)
 
     launch_bwd_full[
         DTYPE,
+        WDTYPE,
         N_ELTS,
         WIDTH,
         HAS_BIAS,

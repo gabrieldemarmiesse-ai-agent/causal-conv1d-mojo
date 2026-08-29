@@ -23,18 +23,19 @@ def call_update_cpu(config: tuple, runtime_args: tuple) -> None:
 
 
 def _mod_name(config: tuple) -> str:
-    (dt, w, hb, silu, hi, circ) = config
-    return f"{_DTYPE_NAME[dt]}_w{w}_hb{int(hb)}_silu{int(silu)}_hi{int(hi)}_circ{int(circ)}"
+    (dt, wdt, w, hb, silu, hi, circ) = config
+    return f"{_DTYPE_NAME[dt]}_w{_DTYPE_NAME[wdt]}_w{w}_hb{int(hb)}_silu{int(silu)}_hi{int(hi)}_circ{int(circ)}"
 
 
 def _defines(config: tuple) -> dict[str, str]:
-    (dt, w, hb, silu, hi, circ) = config
+    (dt, wdt, w, hb, silu, hi, circ) = config
 
     def b(x: bool) -> str:
         return "true" if x else "false"
 
     return {
         "DTYPE": _DTYPE_DEFINE[dt],
+        "WDTYPE": _DTYPE_DEFINE[wdt],
         "WIDTH": str(w),
         "HAS_BIAS": b(hb),
         "APPLY_SILU": b(silu),

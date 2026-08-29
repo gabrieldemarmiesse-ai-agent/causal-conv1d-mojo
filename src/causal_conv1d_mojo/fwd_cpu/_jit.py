@@ -1,6 +1,6 @@
 """JIT-on-first-use dispatcher for the CPU forward.
 
-Mirrors `fwd/_jit.py`: each unique config (dtype × width × has_bias ×
+Mirrors `fwd/_jit.py`: each unique config (dtype × wdtype × width × has_bias ×
 has_seq_idx × has_initial_states × apply_silu) compiles the static
 ``fwd_cpu/variant.mojo`` once via ``mojo build -D KEY=VALUE …`` and
 caches the resulting ``.so`` on disk. Replaces the old AOT comptime-
@@ -32,8 +32,8 @@ def call_fwd_cpu(config: tuple, runtime_args: tuple) -> None:
     """JIT-compile (if needed) and dispatch a single CPU fwd call.
 
     Args:
-        config: 6-tuple
-            (dtype_code, width, has_bias, has_seq_idx,
+        config: 7-tuple
+            (dtype_code, wdtype_code, width, has_bias, has_seq_idx,
              has_initial_states, apply_silu).
         runtime_args: positional args forwarded to the variant `.mojo`.
     """
@@ -42,18 +42,19 @@ def call_fwd_cpu(config: tuple, runtime_args: tuple) -> None:
 
 
 def _mod_name(config: tuple) -> str:
-    (dt, w, hb, hs, hi, silu) = config
-    return f"{_DTYPE_NAME[dt]}_w{w}_hb{int(hb)}_hs{int(hs)}_hi{int(hi)}_silu{int(silu)}"
+    (dt, wdt, w, hb, hs, hi, silu) = config
+    return f"{_DTYPE_NAME[dt]}_w{_DTYPE_NAME[wdt]}_w{w}_hb{int(hb)}_hs{int(hs)}_hi{int(hi)}_silu{int(silu)}"
 
 
 def _defines(config: tuple) -> dict[str, str]:
-    (dt, w, hb, hs, hi, silu) = config
+    (dt, wdt, w, hb, hs, hi, silu) = config
 
     def b(x: bool) -> str:
         return "true" if x else "false"
 
     return {
         "DTYPE": _DTYPE_DEFINE[dt],
+        "WDTYPE": _DTYPE_DEFINE[wdt],
         "WIDTH": str(w),
         "HAS_BIAS": b(hb),
         "HAS_SEQ_IDX": b(hs),

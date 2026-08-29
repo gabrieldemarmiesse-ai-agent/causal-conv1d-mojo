@@ -5,6 +5,9 @@
 GPU kernels (`fwd` + `bwd_full` subpackages) when `x.is_cuda` and to
 the CPU kernels otherwise; `bias` may be None on either path.
 
+`weight` and `bias` may use a different fp16/bf16/fp32 dtype from `x`;
+`bias` follows `weight`, while outputs and state tensors follow `x`.
+
 `final_states_out`, when provided, is written in-place with the last
 `W-1` cols of `[initial_states, x]` (or of `x` left zero-padded when
 there are no initial states and `seqlen < W-1`); the backward adds
@@ -259,6 +262,10 @@ _bwd_full_inplace.register_fake(_bwd_full_inplace_fake)
 class _CausalConv1dFn(torch.autograd.Function):
     """fp16/bf16/fp32 autograd op (CUDA + CPU).
 
+    Activations/states and weights/bias are independently typed; bias
+    must match weight. Weight and bias gradients preserve their parameter
+    dtypes after the kernel's fp32 accumulation.
+
     Widths: 2..9 for fp16/bf16, 2..5 for fp32; backward additionally
     requires seqlen aligned to 1024 when width > 5, plus 16-byte-aligned
     x rows when x is seqlen-contiguous.
@@ -456,8 +463,8 @@ def causal_conv1d_fn(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     x: (batch, dim, seqlen)
-    weight: (dim, width)
-    bias: (dim,)
+    weight: (dim, width), fp16/bf16/fp32 (may differ from x.dtype)
+    bias: (dim,), same dtype as weight
     seq_idx: (batch, seqlen)
     initial_states: (batch, dim, width - 1)
     final_states_out: (batch, dim, width - 1), to be written to
@@ -468,10 +475,35 @@ def causal_conv1d_fn(
     only to positions belonging to the first packed sequence in each row.
     Positions with seq_idx < 0 are padding and produce zero output.
 
-    out: (batch, dim, seqlen)
+    out: (batch, dim, seqlen), same dtype as x
     """
-    # MPS small-shape fast path — bypass all validation so tiny calls
-    # don't pay ~9μs of Python checks on top of an already-cheap conv.
+    if x.dtype not in _DTYPE_CODE:
+        raise NotImplementedError(
+            f"unsupported x dtype {x.dtype}; only fp16/bf16/fp32 are supported"
+        )
+    if weight.dtype not in _DTYPE_CODE:
+        raise NotImplementedError(
+            f"unsupported weight dtype {weight.dtype}; "
+            f"only fp16/bf16/fp32 are supported"
+        )
+    if bias is not None and bias.dtype != weight.dtype:
+        raise NotImplementedError(
+            f"bias.dtype ({bias.dtype}) must match weight.dtype ({weight.dtype})"
+        )
+    if initial_states is not None and initial_states.dtype != x.dtype:
+        raise ValueError(
+            f"initial_states.dtype ({initial_states.dtype}) must match "
+            f"x.dtype ({x.dtype})"
+        )
+    if final_states_out is not None and final_states_out.dtype != x.dtype:
+        raise ValueError(
+            f"final_states_out.dtype ({final_states_out.dtype}) "
+            f"must match x.dtype ({x.dtype})"
+        )
+
+    # MPS small-shape fast path — after enforcing the dtype contract,
+    # bypass the remaining validation so tiny calls don't pay ~9μs of
+    # Python checks on top of an already-cheap conv.
     # The Mojo kernel beats pure-PyTorch only at B*D*L >= ~4M on Apple
     # GPUs, so below that we route straight to causal_conv1d_ref.
     # `causal_conv1d_ref` and the PyTorch ops it calls do their own input
@@ -479,7 +511,14 @@ def causal_conv1d_fn(
     # messages than the wrapper would give). Packed-sequence calls stay
     # on the Mojo path; dim must be positive because F.conv1d rejects
     # groups=0.
-    if x.device.type == "mps" and seq_idx is None:
+    #
+    # Mixed dtypes stay on the Mojo path too. `causal_conv1d_ref` mirrors
+    # upstream's reference, which rounds x through `weight.dtype` before
+    # convolving (`x = x.to(weight.dtype)`); the kernels instead widen x
+    # and the parameters to fp32 independently. Those agree only while the
+    # dtypes match, so routing a narrower-weight call here would make the
+    # same arguments give a different answer either side of the threshold.
+    if x.device.type == "mps" and seq_idx is None and weight.dtype == x.dtype:
         B, D, L = x.shape
         if D > 0 and 0 < B * D * L < _MPS_FWD_FALLBACK_THRESHOLD:
             return causal_conv1d_ref(
@@ -495,18 +534,6 @@ def causal_conv1d_fn(
     if activation not in (None, "silu", "swish"):
         raise NotImplementedError(
             "only activation in {None, 'silu', 'swish'} is supported"
-        )
-    if x.dtype not in _DTYPE_CODE:
-        raise NotImplementedError(
-            f"unsupported dtype {x.dtype}; only fp16/bf16/fp32 are supported"
-        )
-    if weight.dtype != x.dtype:
-        raise NotImplementedError(
-            f"weight.dtype ({weight.dtype}) must match x.dtype ({x.dtype})"
-        )
-    if bias is not None and bias.dtype != x.dtype:
-        raise NotImplementedError(
-            f"bias.dtype ({bias.dtype}) must match x.dtype ({x.dtype})"
         )
     # Width support is dtype- and seqlen-dependent because the kernels
     # share boundary x values across threads via a smem ring buffer
@@ -587,11 +614,6 @@ def causal_conv1d_fn(
                 f"initial_states shape {tuple(initial_states.shape)} != "
                 f"expected {(batch, dim, width - 1)}"
             )
-        if initial_states.dtype != x.dtype:
-            raise ValueError(
-                f"initial_states.dtype ({initial_states.dtype}) must match "
-                f"x.dtype ({x.dtype})"
-            )
         if initial_states.device != x.device:
             raise ValueError(
                 f"initial_states.device ({initial_states.device}) must "
@@ -614,11 +636,6 @@ def causal_conv1d_fn(
                 raise ValueError(
                     f"final_states_out shape {tuple(final_states_out.shape)} "
                     f"!= expected {(batch, dim, width - 1)}"
-                )
-            if final_states_out.dtype != x.dtype:
-                raise ValueError(
-                    f"final_states_out.dtype ({final_states_out.dtype}) "
-                    f"must match x.dtype ({x.dtype})"
                 )
             if final_states_out.device != x.device:
                 raise ValueError(

@@ -17,11 +17,11 @@ def native_fwd(
     out: torch.Tensor,
     apply_silu: bool,
 ) -> None:
-    # The 30-tuple expected by the JIT-generated variant entry point.
-    # Each unique runtime config (dtype × width × has_bias × has_seq_idx ×
-    # has_initial_states × apply_silu × contig_inner × aligned_seq ×
-    # vec_aligned × channel_last) lazily compiles its own single-variant
-    # `.so` on first use, then caches it under
+    # The 31-tuple expected by the JIT-generated variant entry point.
+    # Each unique runtime config (dtype × wdtype × width × has_bias ×
+    # has_seq_idx × has_initial_states × apply_silu × contig_inner ×
+    # aligned_seq × vec_aligned × channel_last) lazily compiles its own
+    # single-variant `.so` on first use, then caches it under
     # `$XDG_CACHE_HOME/causal_conv1d_mojo/fwd/` for future processes.
     from causal_conv1d_mojo.fwd._jit import call_fwd
 
@@ -45,6 +45,7 @@ def native_fwd(
             int(bias is not None),
             int(apply_silu),
             _DTYPE_CODE[x.dtype],
+            _DTYPE_CODE[weight.dtype],
             torch.cuda.current_stream().cuda_stream,
             int(seq_idx is not None),
             _ptr(seq_idx),
@@ -113,6 +114,7 @@ def native_fwd_mps(
             int(bias is not None),
             int(apply_silu),
             _DTYPE_CODE[x.dtype],
+            _DTYPE_CODE[weight.dtype],
             0,  # stream_handle_addr — Metal has no streams; enqueue on ctx
             int(seq_idx is not None),
             gpu_address_or_zero(seq_idx),

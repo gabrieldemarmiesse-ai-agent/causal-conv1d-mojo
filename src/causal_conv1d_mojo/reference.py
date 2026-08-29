@@ -46,6 +46,7 @@ def causal_conv1d_ref(
     if activation not in [None, "silu", "swish"]:
         raise NotImplementedError("activation must be None, silu, or swish")
     dtype_in = x.dtype
+    x_input = x
     x = x.to(weight.dtype)
     seqlen = x.shape[-1]
     dim, width = weight.shape
@@ -72,12 +73,28 @@ def causal_conv1d_ref(
     elif initial_states is None:
         out = F.conv1d(x, weight.unsqueeze(1), bias, padding=width - 1, groups=dim)
     else:
-        x = torch.cat([initial_states, x], dim=-1)
+        # The kernel converts both input/state values to fp32 only after
+        # loading them from their shared input dtype. Cast the state to
+        # weight dtype here before concatenation: torch.cat promotes an
+        # fp16/bf16 pair to fp32, which would otherwise make F.conv1d
+        # reject fp16/bf16 weights and bias for that one mixed pair.
+        x = torch.cat([initial_states.to(weight.dtype), x], dim=-1)
         out = F.conv1d(x, weight.unsqueeze(1), bias, padding=0, groups=dim)
     out = out[..., :seqlen]
     if return_final_states:
         # (batch, dim, width - 1)
-        final_states = F.pad(x, (width - 1 - x.shape[-1], 0)).to(dtype_in)
+        # Same window as upstream (the last W-1 of `[initial_states, x]`,
+        # left zero-padded when that is shorter than W-1), but sliced
+        # from the *input-typed* tensors: final_states is input_t
+        # upstream, and rounding it through the weight_t cast used only
+        # for the conv arithmetic would lose precision when the dtypes
+        # differ.
+        src = (
+            x_input
+            if initial_states is None
+            else torch.cat([initial_states, x_input], dim=-1)
+        )
+        final_states = F.pad(src, (width - 1 - src.shape[-1], 0)).to(dtype_in)
         if final_states_out is not None:
             final_states_out.copy_(final_states)
         else:
@@ -120,8 +137,11 @@ def causal_conv1d_update_ref(
     assert weight.shape == (dim, width)
     if cache_seqlens is None:
         # (batch, dim, state_len + seqlen)
-        x_new = torch.cat([conv_state, x], dim=-1).to(weight.dtype)
-        conv_state.copy_(x_new[:, :, -state_len:])
+        x_new_input = torch.cat([conv_state, x], dim=-1)
+        # State is input_t upstream: shifting it must not round the
+        # retained history through weight_t when the dtypes differ.
+        conv_state.copy_(x_new_input[:, :, -state_len:])
+        x_new = x_new_input.to(weight.dtype)
     else:
         width_idx = torch.arange(
             -(width - 1), 0, dtype=torch.long, device=x.device

@@ -3,6 +3,8 @@
 No upstream analogue — this exists so the package works on a machine
 without a GPU. The GPU kernels under `bwd_full/` are the real product;
 this is the fallback — but a fast one.
+Input/state/dout/dx use `dtype`; weight/bias use `wdtype`, and parameter
+loads convert to fp32 before arithmetic.
 
 Computes `dx, dweight, dbias, dinitial_states` from
 `x, weight, bias, dout`:
@@ -140,6 +142,7 @@ def _dpre_scalar[
 
 def bwd_kernel_cpu[
     dtype: DType,
+    wdtype: DType,
     width: Int,
     has_bias: Bool,
     has_seq_idx: Bool,
@@ -154,10 +157,10 @@ def bwd_kernel_cpu[
     x_bs: Int,
     x_cs: Int,
     x_ls: Int,
-    w_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    w_ptr: UnsafePointer[Scalar[wdtype], MutAnyOrigin],
     w_cs: Int,
     w_ws: Int,
-    bias_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    bias_ptr: UnsafePointer[Scalar[wdtype], MutAnyOrigin],
     dout_ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
     dout_bs: Int,
     dout_cs: Int,

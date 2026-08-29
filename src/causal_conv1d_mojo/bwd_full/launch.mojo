@@ -34,6 +34,7 @@ from common import (
 
 def launch_bwd_full[
     dtype: DType,
+    wdtype: DType,
     n_elts: Int,
     width: Int,
     has_bias: Bool,
@@ -109,10 +110,10 @@ def launch_bwd_full[
     var x_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
         unsafe_from_address=x_addr
     )
-    var w_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
+    var w_ptr = UnsafePointer[Scalar[wdtype], MutAnyOrigin](
         unsafe_from_address=w_addr
     )
-    var b_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
+    var b_ptr = UnsafePointer[Scalar[wdtype], MutAnyOrigin](
         unsafe_from_address=b_addr
     )
     var dout_ptr = UnsafePointer[Scalar[dtype], MutAnyOrigin](
@@ -152,6 +153,7 @@ def launch_bwd_full[
             var compiled_cl = ctx.compile_function[
                 bwd_channellast_kernel[
                     dtype,
+                    wdtype,
                     kChunkL,
                     width,
                     has_bias,
@@ -305,7 +307,7 @@ def launch_bwd_full[
         DILT: TensorLayout,
     ](
         x_tt: TileTensor[dtype, XLT, ImmutAnyOrigin],
-        w_tt: TileTensor[dtype, WLT, ImmutAnyOrigin],
+        w_tt: TileTensor[wdtype, WLT, ImmutAnyOrigin],
         dout_tt: TileTensor[dtype, DoutLT, ImmutAnyOrigin],
         dx_tt: TileTensor[mut=True, dtype, DxLT, MutAnyOrigin],
         s_tt: TileTensor[DType.int32, SLT, ImmutAnyOrigin],
@@ -315,6 +317,7 @@ def launch_bwd_full[
         var compiled = ctx.compile_function[
             bwd_full_kernel[
                 dtype,
+                wdtype,
                 n_elts,
                 width,
                 has_bias,

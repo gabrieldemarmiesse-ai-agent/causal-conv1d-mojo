@@ -39,8 +39,8 @@ def causal_conv1d_update(
         dropped, new x values are appended on the right. Circular mode
         (cache_seqlens != None): writes happen at `cache_seqlens[b]`
         with wrap-around modulo `state_len`.
-    weight: (dim, width)
-    bias: (dim,) or None
+    weight: (dim, width), fp16/bf16/fp32 (may differ from x.dtype)
+    bias: (dim,) or None, same dtype as weight
     activation: None | "silu" | "swish"
     cache_seqlens: (batch,) int32 or None. When set, conv_state is
         treated as a circular buffer; cache_seqlens[b] is the per-batch
@@ -54,15 +54,45 @@ def causal_conv1d_update(
         untouched. cache_seqlens is still indexed by `b`, not the
         redirected coord (matching upstream).
 
-    Returns: out tensor with the same shape as `x`.
+    Returns: out tensor with the same shape and dtype as `x`.
     """
-    # MPS small-shape fast path — bypass all validation so tiny decode
-    # calls don't pay Python overhead on top of an already-cheap conv.
+    if x.dtype not in _DTYPE_CODE:
+        raise NotImplementedError(
+            f"unsupported x dtype {x.dtype}; only fp16/bf16/fp32 are supported"
+        )
+    if weight.dtype not in _DTYPE_CODE:
+        raise NotImplementedError(
+            f"unsupported weight dtype {weight.dtype}; "
+            f"only fp16/bf16/fp32 are supported"
+        )
+    if bias is not None and bias.dtype != weight.dtype:
+        raise NotImplementedError(
+            f"bias.dtype ({bias.dtype}) must match weight.dtype ({weight.dtype})"
+        )
+    if conv_state.dtype != x.dtype:
+        raise NotImplementedError(
+            f"conv_state.dtype ({conv_state.dtype}) must match x.dtype ({x.dtype})"
+        )
+
+    # MPS small-shape fast path — after enforcing the dtype contract,
+    # bypass the remaining validation so tiny decode calls don't pay
+    # Python overhead on top of an already-cheap conv.
     # The Mojo update kernel only beats pure-PyTorch above B*D ~ 64K on
     # Apple GPUs. Ref handles both 2-D and 3-D x internally. Only safe
     # when conv_state_indices is None (ref doesn't support paged caches)
     # and dim > 0 (F.conv1d rejects groups=0).
-    if x.device.type == "mps" and conv_state_indices is None:
+    #
+    # Mixed dtypes stay on the Mojo path: `causal_conv1d_update_ref`
+    # mirrors upstream and rounds the history through `weight.dtype`
+    # before the taps, while the kernel widens x and the parameters to
+    # fp32 independently. (The retained state is unaffected either way —
+    # ref shifts it before the arithmetic cast.) Routing a narrower-weight
+    # call here would change the output either side of the threshold.
+    if (
+        x.device.type == "mps"
+        and conv_state_indices is None
+        and weight.dtype == x.dtype
+    ):
         # x is (B, D) or (B, D, L); D and the element count are what
         # gate the fallback, and ref handles both ranks.
         x_shape = x.shape
@@ -85,22 +115,6 @@ def causal_conv1d_update(
     if activation not in (None, "silu", "swish"):
         raise NotImplementedError(
             "only activation in {None, 'silu', 'swish'} is supported"
-        )
-    if x.dtype not in _DTYPE_CODE:
-        raise NotImplementedError(
-            f"unsupported dtype {x.dtype}; only fp16/bf16/fp32 are supported"
-        )
-    if weight.dtype != x.dtype:
-        raise NotImplementedError(
-            f"weight.dtype ({weight.dtype}) must match x.dtype ({x.dtype})"
-        )
-    if bias is not None and bias.dtype != x.dtype:
-        raise NotImplementedError(
-            f"bias.dtype ({bias.dtype}) must match x.dtype ({x.dtype})"
-        )
-    if conv_state.dtype != x.dtype:
-        raise NotImplementedError(
-            f"conv_state.dtype ({conv_state.dtype}) must match x.dtype ({x.dtype})"
         )
     # The update kernel has no smem halo dance (single-step write into
     # the rolling state buffer), so unlike the fwd/bwd path it isn't

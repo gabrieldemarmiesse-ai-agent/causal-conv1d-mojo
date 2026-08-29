@@ -18,7 +18,7 @@ def native_update(
     out: torch.Tensor,
     apply_silu: bool,
 ) -> None:
-    # 30-tuple expected by the JIT-generated variant entry point.
+    # 31-tuple expected by the JIT-generated variant entry point.
     # Each unique runtime config lazily compiles its own single-variant
     # `.so` on first use, then caches it under
     # `$XDG_CACHE_HOME/causal_conv1d_mojo/update/`.
@@ -49,6 +49,7 @@ def native_update(
             int(bias is not None),
             int(apply_silu),
             _DTYPE_CODE[x.dtype],
+            _DTYPE_CODE[weight.dtype],
             torch.cuda.current_stream().cuda_stream,
             weight.shape[1],
             int(state_indices is not None),
@@ -107,6 +108,7 @@ def native_update_mps(
             int(bias is not None),
             int(apply_silu),
             _DTYPE_CODE[x.dtype],
+            _DTYPE_CODE[weight.dtype],
             0,  # stream_handle_addr — Metal has no streams
             weight.shape[1],
             int(state_indices is not None),

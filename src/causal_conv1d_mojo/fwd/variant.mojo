@@ -6,10 +6,11 @@ to the previous f-string codegen, this keeps the Mojo source out of
 Python literals and lets `mojo build` handle the parameter wiring.
 
 The Python wrapper:
-- Computes the config tuple (dtype, width, has_bias, …).
+- Computes the config tuple (dtype, wdtype, width, has_bias, …).
 - Picks a stable, human-readable ``mod_name`` from the config (used
   only for the cache directory + the loaded module name).
-- Calls `mojo build variant.mojo -D DTYPE=float16 -D WIDTH=4 …` and
+- Calls `mojo build variant.mojo -D DTYPE=float16 -D WDTYPE=float32
+  -D WIDTH=4 …` and
   caches the resulting `.so` content-addressed.
 """
 
@@ -27,6 +28,7 @@ from launch import launch_fwd
 from _ctx import acquire_ctx_handle
 
 comptime DTYPE = get_defined_dtype["DTYPE", DType.float32]()
+comptime WDTYPE = get_defined_dtype["WDTYPE", DType.float32]()
 comptime WIDTH = get_defined_int["WIDTH"]()
 comptime HAS_BIAS = get_defined_bool["HAS_BIAS"]()
 comptime HAS_SEQ_IDX = get_defined_bool["HAS_SEQ_IDX"]()
@@ -75,23 +77,24 @@ def causal_conv1d_fwd_variant(
     var o_b_stride = UInt32(py=args[12])
     var o_c_stride = UInt32(py=args[13])
     var o_l_stride = UInt32(py=args[14])
-    var stream_handle_addr = Int(py=args[18])
-    var seq_idx_addr = Int(py=args[20])
-    var seq_idx_b_stride = UInt32(py=args[21])
-    var seq_idx_l_stride = UInt32(py=args[22])
-    var initial_states_addr = Int(py=args[25])
-    var initial_states_b_stride = UInt32(py=args[26])
-    var initial_states_c_stride = UInt32(py=args[27])
-    var initial_states_l_stride = UInt32(py=args[28])
-    # args[29] is `use_external_stream` (already a comptime define).
-    # ctx_handle is appended as the 30th positional by `call_fwd`.
-    var ctx_handle_addr = Int(py=args[30])
+    var stream_handle_addr = Int(py=args[19])
+    var seq_idx_addr = Int(py=args[21])
+    var seq_idx_b_stride = UInt32(py=args[22])
+    var seq_idx_l_stride = UInt32(py=args[23])
+    var initial_states_addr = Int(py=args[26])
+    var initial_states_b_stride = UInt32(py=args[27])
+    var initial_states_c_stride = UInt32(py=args[28])
+    var initial_states_l_stride = UInt32(py=args[29])
+    # args[30] is `use_external_stream` (already a comptime define).
+    # ctx_handle is appended as the 32nd positional by `call_fwd`.
+    var ctx_handle_addr = Int(py=args[31])
 
     if batch_int == 0 or dim_int == 0 or seqlen_int == 0:
         return PythonObject(None)
 
     launch_fwd[
         DTYPE,
+        WDTYPE,
         WIDTH,
         HAS_BIAS,
         HAS_SEQ_IDX,
